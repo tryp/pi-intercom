@@ -118,6 +118,36 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Infer the intercom action from other parameters when the model omits `action`.
+ * Returns a valid action string, defaulting to "list" when intent is unclear.
+ */
+function inferAction(params: {
+  to?: string;
+  message?: string;
+  messageId?: string;
+  cwd?: string;
+}): "list" | "list-cwd" | "send" | "ask" | "reply" | "pending" | "status" | "cancel" {
+  const { to, message, messageId, cwd } = params;
+
+  // messageId present → cancel
+  if (messageId) return "cancel";
+
+  // message + target → send (most common case)
+  if (message && (to || cwd)) return "send";
+
+  // message without target → reply (if there's a pending ask) or send (if only one peer)
+  // We can't check replyTracker here, so default to "send" — the send handler
+  // will infer reply from pending asks.
+  if (message && !to && !cwd) return "send";
+
+  // cwd without message → list-cwd
+  if (cwd && !message) return "list-cwd";
+
+  // Default: list sessions
+  return "list";
+}
+
 export function explicitCrossMachineSendRestriction(options: {
   to?: string;
   cwd?: string;
@@ -2227,9 +2257,9 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'",
-      }),
+      action: Type.Optional(StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'. Inferred from other parameters when omitted.",
+      })),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
@@ -2278,7 +2308,10 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
+      const { action: rawAction, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
+
+      // Infer action when omitted, based on what other parameters are present.
+      const action = rawAction ?? inferAction({ to, message, messageId, cwd });
 
       switch (action) {
         case "list": {
@@ -2786,7 +2819,7 @@ Usage:
       }
     },
     renderCall(args, theme) {
-      const action = typeof args.action === "string" ? args.action : "intercom";
+      const action = typeof args.action === "string" ? args.action : "inferred";
       const target = typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined;
       const messagePreview = previewText(args.message, 96);
       const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
