@@ -2250,7 +2250,7 @@ Usage:
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
-  intercom({ action: "reply", message: "..." })                      → Reply to the active/single pending ask
+  intercom({ action: "reply", message: "..." })                      → Reply to the active inbound context or a single pending ask; errors if neither exists
   intercom({ action: "pending" })                                      → List unresolved inbound asks
   intercom({ action: "status" })                  → Show connection status`,
     promptSnippet:
@@ -2258,7 +2258,7 @@ Usage:
 
     parameters: Type.Object({
       action: Type.Optional(StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'. Inferred from other parameters when omitted.",
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'. 'reply' answers the active inbound context or a pending ask; without either it errors. Inferred from other parameters when omitted.",
       })),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
@@ -2273,7 +2273,7 @@ Usage:
         language: Type.Optional(Type.String()),
       }))),
       replyTo: Type.Optional(Type.String({
-        description: "Message ID to reply to (for threading or responding to an 'ask')",
+        description: "Message ID of a still-pending ask to reply to. This preserves threading; arbitrary past or already-resolved messages are not valid reply targets.",
       })),
       messageId: Type.Optional(Type.String({
         description: "Message ID for actions that operate on an existing message, such as 'cancel'.",

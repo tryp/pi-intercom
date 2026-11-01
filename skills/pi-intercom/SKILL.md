@@ -77,7 +77,7 @@ intercom({ action: "list" })
 
 ### Pattern 3: Reply Naturally
 
-When responding to an inbound ask, prefer `reply` instead of reconstructing raw IDs:
+Use `reply` for the active inbound context or a still-pending ask; it cannot target an arbitrary past or already-resolved message. If there is no active context or matching pending ask, `reply` returns an error (`No active intercom context to reply to`; an explicit `replyTo` with no pending ask returns `No pending ask with message ID ...`). Prefer `reply` instead of reconstructing raw IDs:
 
 ```typescript
 // In the turn triggered by the ask:
@@ -91,7 +91,7 @@ intercom({ action: "pending" })
 intercom({ action: "reply", to: "planner", message: "Use exponential backoff starting at 100ms." })
 ```
 
-`reply` still preserves exact threading under the hood by sending the response with the original `replyTo` value.
+`reply` preserves exact threading by sending the response with the original `replyTo` value. An explicit `replyTo` must identify a still-pending ask; use `pending` to inspect unresolved asks before replying later.
 
 ### Pattern 4: Broadcast to Multiple Workers
 
@@ -234,7 +234,7 @@ new visible project panes should go through the supervisor.
 |--------|----------|----------|
 | `send` | Fire-and-forget; infers the sole pending ask as its reply | You don't need a response |
 | `ask` | Blocks until reply (10 min default, configurable with `PI_INTERCOM_ASK_TIMEOUT_MS`) | You need an answer to continue |
-| `reply` | Responds to the active or pending inbound ask | You were asked something and need to answer naturally |
+| `reply` | Responds to the active inbound context or a pending ask; errors if neither exists | You were asked something and need to answer naturally |
 | `pending` | Lists unresolved inbound asks | You need to see who is waiting before replying |
 | `list` | Returns all sessions with live status and freshly resolved Herdr location | You need to discover targets or choose an idle peer |
 | `status` | Returns your connection state | Troubleshooting |
