@@ -2250,7 +2250,7 @@ Usage:
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
-  intercom({ action: "reply", message: "..." })                      → Reply to the active inbound context or a single pending ask; errors if neither exists
+  intercom({ action: "reply", message: "..." })                      → Answer an outstanding ask; use replyTo (or to) to select one when several are pending. Use send for unsolicited messages.
   intercom({ action: "pending" })                                      → List unresolved inbound asks
   intercom({ action: "status" })                  → Show connection status`,
     promptSnippet:
@@ -2258,7 +2258,7 @@ Usage:
 
     parameters: Type.Object({
       action: Type.Optional(StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'. 'reply' answers the active inbound context or a pending ask; without either it errors. Inferred from other parameters when omitted.",
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'. 'reply' answers an outstanding ask (active context or pending ask); it errors if none is available. Use replyTo, or to when several asks are pending, to select the ask. Use 'send' for unsolicited messages. Inferred from other parameters when omitted.",
       })),
       to: Type.Optional(Type.String({
         description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
