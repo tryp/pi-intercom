@@ -2,7 +2,7 @@ import net from "net";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { join } from "path";
 import { createHash, randomUUID } from "crypto";
-import { writeMessage, createMessageReader } from "./framing.ts";
+import { writeMessage, createMessageReader, MAX_FRAME_BYTES } from "./framing.ts";
 import { isMessage, isMessageReceipt, isSessionId, isSessionRegistration, messageDeliveryFingerprint } from "./protocol.ts";
 import {
   ensureIntercomRuntimeDir,
@@ -18,8 +18,8 @@ import {
 } from "./paths.ts";
 import { getAskTimeoutMs } from "../config.ts";
 import { sameCwd } from "../cwd.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE } from "../types.ts";
-import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl } from "../types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE } from "../types.ts";
+import type { DeliveryState, SessionInfo, Message, BrokerMessage, ExtensionCapability, MessageControl, MessageReceiptStatus } from "../types.ts";
 import { ExtensionStateManager } from "./extension-state.ts";
 import { assertNoLiveBroker } from "./runtime-claim.ts";
 import { resolveHerdrLocations } from "../herdr-location.ts";
@@ -45,6 +45,17 @@ const MAILBOX_MESSAGE_RETENTION_MS = 24 * 60 * 60 * 1000;
 const MAX_MAILBOX_MESSAGES = 256;
 const DELIVERY_RECORD_RETENTION_MS = 60 * 60 * 1000;
 const MAX_DELIVERY_RECORDS = 4096;
+// Must stay below the client's 10s send timeout, so an unconfirmed send resolves as unknown instead of throwing.
+const RECEIPT_TIMEOUT_MS = readPositiveIntEnv(process.env.PI_INTERCOM_RECEIPT_TIMEOUT_MS, 5000, 10_000);
+const RECEIPT_PROOF_STATUSES = new Set<MessageReceiptStatus>(["receiver_received", "acknowledged", "queued", "injected"]);
+const LIVENESS_MISSED_INTERVALS = 3;
+const LIVENESS_SWEEP_MS = readPositiveIntEnv(process.env.PI_INTERCOM_LIVENESS_SWEEP_MS, 10_000);
+const TCP_KEEPALIVE_DELAY_MS = 30_000;
+
+function readPositiveIntEnv(raw: string | undefined, fallback: number, limit = Infinity): number {
+  const value = Number(raw);
+  return Number.isSafeInteger(value) && value > 0 && value < limit ? value : fallback;
+}
 
 function serializedPayloadSize(payload: unknown): number | null {
   try {
@@ -66,15 +77,31 @@ interface ConnectedSession {
   /** Stable Pi session identity used only for live Herdr snapshot joins. This
    * is a self-asserted local-client hint, not authenticated location evidence. */
   herdrSessionPath?: string;
+  acknowledgesReceipts: boolean;
+  /** Heartbeat interval the client promised; absent for clients that never heartbeat. */
+  livenessIntervalMs?: number;
+  lastInboundAt: number;
+}
+
+/** A socket delivery whose success reply waits for the receiver's receipt. */
+interface PendingReceipt {
+  senderSocket: net.Socket;
+  fromKey: string;
+  messageId: string;
+  targetSocket: net.Socket;
+  scopeId?: string;
+  replyTo?: string;
+  demoted?: "late_reply";
+  timer: NodeJS.Timeout;
 }
 
 interface DeliveryRecord {
   fingerprint: string;
   state: DeliveryState;
+  demoted?: "late_reply";
   reason?: string;
   code?: string;
   retryable: boolean;
-  outcomeKnown: boolean;
   createdAt: number;
 }
 
@@ -113,6 +140,8 @@ interface PendingAskRecord {
 interface MessageReceiptRoute {
   from: string;
   to: string;
+  /** Set for asks, so only an ask can be answered by a late reply. Asks are never queued. */
+  expectsReply?: boolean;
   createdAt: number;
 }
 
@@ -143,6 +172,18 @@ function normalizeScopeId(value: unknown): string | undefined {
   }
   const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
+}
+
+// Clients share this host, so a signal-0 probe tells whether a claimed pid still runs.
+// EPERM means it exists under another user.
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return isRecord(error) && error.code === "EPERM";
+  }
 }
 
 function sameScope(a: string | undefined, b: string | undefined): boolean {
@@ -210,9 +251,11 @@ class IntercomBroker {
   private disconnectedSessions = new Map<string, DisconnectedSession>();
   private mailboxMessages: MailboxMessage[] = [];
   private deliveryRecords = new Map<string, DeliveryRecord>();
+  private pendingReceipts = new Map<string, PendingReceipt>();
   private connections = new Set<net.Socket>();
   private unregisteredConnections = new Set<net.Socket>();
   private server: net.Server;
+  private lastLivenessSweepAt = Date.now();
   private shutdownTimer: NodeJS.Timeout | null = null;
   private readonly askTimeoutMs = getAskTimeoutMs();
   private namespaceOwners = new Map<string, NamespaceOwner>();
@@ -221,7 +264,6 @@ class IntercomBroker {
 
   constructor() {
     ensureIntercomRuntimeDir(INTERCOM_DIR);
-    assertNoLiveBroker(PID_PATH);
     ensurePendingAskRecordDir();
     this.prunePendingAskRecords();
     this.extensionStateManager = new ExtensionStateManager(INTERCOM_DIR);
@@ -265,10 +307,35 @@ class IntercomBroker {
     }
     process.on("SIGTERM", () => this.shutdown());
     process.on("SIGINT", () => this.shutdown());
+    setInterval(() => this.evictSilentSessions(), LIVENESS_SWEEP_MS).unref();
+  }
+
+  // A process that died without closing its socket can leave it open, and writes to it
+  // still succeed. Dropping a session whose client stopped heartbeating hands its mail
+  // to the mailbox through the normal close path.
+  private evictSilentSessions(): void {
+    const now = Date.now();
+    const sinceLastSweepMs = now - this.lastLivenessSweepAt;
+    this.lastLivenessSweepAt = now;
+    // A sweep this late means the broker itself was paused (system sleep suspends the
+    // broker and its clients together); a missed tick plus 1s covers ordinary timer lag.
+    if (sinceLastSweepMs > 2 * LIVENESS_SWEEP_MS + 1000) {
+      for (const session of this.sessions.values()) session.lastInboundAt = now;
+      return;
+    }
+    for (const session of this.sessions.values()) {
+      if (session.livenessIntervalMs === undefined) continue;
+      const silentMs = now - session.lastInboundAt;
+      if (silentMs <= session.livenessIntervalMs * LIVENESS_MISSED_INTERVALS) continue;
+      console.log(`Dropping session ${session.info.id}: no heartbeat for ${silentMs}ms`);
+      session.socket.destroy();
+    }
   }
 
   private handleConnection(socket: net.Socket): void {
     this.connections.add(socket);
+    // Lets the OS notice a dead peer on the TCP transport; pipes and Unix sockets ignore it.
+    socket.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
     let sessionKey: string | null = null;
     let registrationTimeout: NodeJS.Timeout | null = null;
     const armRegistrationTimeout = () => {
@@ -305,6 +372,8 @@ class IntercomBroker {
         socket.destroy(new Error("Intercom broker rate limit exceeded"));
         return;
       }
+      const session = sessionKey ? this.sessions.get(sessionKey) : undefined;
+      if (session?.socket === socket) session.lastInboundAt = Date.now();
       this.handleMessage(socket, msg, sessionKey, (id) => {
         sessionKey = id;
         if (id) {
@@ -322,6 +391,7 @@ class IntercomBroker {
     socket.on("close", () => {
       clearRegistrationTimeout();
       this.connections.delete(socket);
+      this.settlePendingReceiptsForSocket(socket);
       if (sessionKey) {
         const existing = this.sessions.get(sessionKey);
         if (existing?.socket === socket) {
@@ -370,16 +440,23 @@ class IntercomBroker {
     return true;
   }
 
-  private scheduleShutdownCheck(): void {
+  private scheduleShutdownCheck(delayMs = 5000): void {
     if (this.shutdownTimer) return;
 
     this.shutdownTimer = setTimeout(() => {
       this.shutdownTimer = null;
-      if (this.sessions.size === 0) {
-        console.log("No sessions connected, shutting down");
-        this.shutdown();
+      if (this.sessions.size > 0) return;
+      const now = Date.now();
+      this.pruneMailboxMessages(now);
+      // Queued mail keeps the broker up until it is delivered or expires; recheck at the next expiry.
+      if (this.mailboxMessages.length > 0) {
+        const oldestQueuedAt = Math.min(...this.mailboxMessages.map(entry => entry.queuedAt));
+        this.scheduleShutdownCheck(Math.max(oldestQueuedAt + MAILBOX_MESSAGE_RETENTION_MS - now + 1, 1000));
+        return;
       }
-    }, 5000);
+      console.log("No sessions connected, shutting down");
+      this.shutdown();
+    }, delayMs);
   }
 
   private handleMessage(
@@ -460,6 +537,19 @@ class IntercomBroker {
           socket.destroy();
           break;
         }
+        if (previous && previous.info.pid !== session.pid && isProcessAlive(previous.info.pid)) {
+          // Another live process holds this id. Keep it; handing the id over makes the
+          // two processes evict each other on every reconnect (#155).
+          const holder = previous.info;
+          writeMessage(socket, {
+            type: "error",
+            code: SESSION_HELD_ERROR_CODE,
+            error: `Intercom session ${id} is held by live process ${holder.pid} in ${holder.cwd}`,
+            holder: { pid: holder.pid, cwd: holder.cwd, ...(holder.name !== undefined ? { name: holder.name } : {}) },
+          });
+          socket.end();
+          break;
+        }
         if (previous) {
           this.clearMessageReceiptRoutesForSession(key);
           previous.socket.end();
@@ -490,6 +580,9 @@ class IntercomBroker {
           ownerOrder: previous?.ownerOrder ?? this.nextOwnerOrder++,
           extensions,
           ...(session.herdrSessionPath ? { herdrSessionPath: session.herdrSessionPath } : {}),
+          acknowledgesReceipts: session.acknowledgesReceipts === true,
+          ...(session.livenessIntervalMs !== undefined ? { livenessIntervalMs: session.livenessIntervalMs } : {}),
+          lastInboundAt: Date.now(),
         };
         this.sessions.set(key, connectedSession);
         this.disconnectedSessions.delete(key);
@@ -636,6 +729,8 @@ class IntercomBroker {
           this.writeDeliveryFailure(socket, messageId, "Invalid message format", "E_INVALID_MESSAGE");
           break;
         }
+        // lateReplyTo is broker-owned: only a late reply demoted below carries it.
+        delete message.lateReplyTo;
         const fromSession = this.sessions.get(currentKey);
         if (!fromSession || fromSession.socket !== socket) {
           this.writeDeliveryFailure(socket, message.id, "Sender session not found", "E_SENDER_NOT_FOUND");
@@ -660,7 +755,7 @@ class IntercomBroker {
         if (hasTargetId && hasTargetEpoch) {
           const targetId = clientMessage.targetId as string;
           const targetEpoch = clientMessage.targetEpoch as string;
-          const fingerprint = this.deliveryFingerprint(message, targetId);
+          const fingerprint = messageDeliveryFingerprint(message, targetId);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
           }
@@ -680,13 +775,13 @@ class IntercomBroker {
 
         const targets = this.findSessions(clientMessage.to, fromSession.scopeId);
         if (targets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
+          const target = targets[0];
+          const fingerprint = messageDeliveryFingerprint(message, target.info.id);
+          if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
             break;
           }
-          const target = targets[0];
-          const fingerprint = this.deliveryFingerprint(message, target.info.id);
-          if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
+          if (message.replyTo && !replyEdge && !this.demoteLateReply(message, currentKey, target.key)) {
+            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
             break;
           }
           if (message.supersedes) {
@@ -703,7 +798,7 @@ class IntercomBroker {
           if (message.expectsReply) {
             const reverseEdge = Array.from(this.askEdges.entries()).find(([edgeMessageId, edge]) => edgeMessageId !== message.replyTo && edge.from === target.key && edge.to === currentKey);
             if (reverseEdge) {
-              this.writeDeliveryFailure(socket, message.id, "Mutual ask refused: target session is already waiting for a reply from this session.", "E_MUTUAL_ASK");
+              this.writeDeliveryFailure(socket, message.id, "Mutual ask refused: target session is already waiting for a reply from this session. Answer its pending ask with reply; a question can go in that reply.", "E_MUTUAL_ASK");
               break;
             }
             this.writePendingAskRecord(message, fromSession, target.info, brokerReceivedAt);
@@ -733,18 +828,13 @@ class IntercomBroker {
             });
             this.updateDeliveryRecord(currentKey, message.supersedes, "failed", `Superseded by ${message.id}`, "E_DELIVERY_SUPERSEDED");
           }
+          this.messageReceiptRoutes.set(message.id, { from: currentKey, to: target.key, ...(message.expectsReply ? { expectsReply: true } : {}), createdAt: brokerReceivedAt });
           writeMessage(target.socket, {
             type: "message",
             from: fromSession.info,
             message: deliveredMessage,
           });
-          if (message.replyTo) {
-            this.askEdges.delete(message.replyTo);
-            this.removePendingAskRecord(message.replyTo, fromSession.scopeId);
-          }
-          this.messageReceiptRoutes.set(message.id, { from: currentKey, to: target.key, createdAt: brokerReceivedAt });
-          this.recordDelivery(currentKey, message.id, fingerprint, "socket_delivered");
-          this.writeDeliverySuccess(socket, message.id, "socket_delivered");
+          this.completeSocketDelivery(socket, currentKey, fromSession.scopeId, target, message, fingerprint);
           break;
         }
 
@@ -755,14 +845,15 @@ class IntercomBroker {
 
         const disconnectedTargets = this.findDisconnectedSessions(clientMessage.to, fromSession.scopeId);
         if (disconnectedTargets.length === 1) {
-          if (message.replyTo && !replyEdge) {
-            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
-            break;
-          }
           const disconnectedTarget = disconnectedTargets[0]!;
           const target = disconnectedTarget.info;
-          const fingerprint = this.deliveryFingerprint(message, target.id);
+          const fingerprint = messageDeliveryFingerprint(message, target.id);
           if (this.replayOrReject(socket, currentKey, message.id, fingerprint)) {
+            break;
+          }
+          // No late-reply demotion here: a disconnected session's receipt routes are cleared.
+          if (message.replyTo && !replyEdge) {
+            this.writeDeliveryFailure(socket, message.id, "Reply target does not match a pending ask", "E_REPLY_TARGET");
             break;
           }
           if (message.supersedes) {
@@ -784,21 +875,19 @@ class IntercomBroker {
               brokerReceivedAt,
               brokerDeliveredAt: Date.now(),
             };
+            this.messageReceiptRoutes.set(message.id, { from: currentKey, to: liveMailboxTarget.key, createdAt: brokerReceivedAt });
             writeMessage(liveMailboxTarget.socket, {
               type: "message",
               from: fromSession.info,
               message: deliveredMessage,
             });
-            this.messageReceiptRoutes.set(message.id, { from: currentKey, to: liveMailboxTarget.key, createdAt: brokerReceivedAt });
-          } else {
-            this.queueMailboxMessage(fromSession, disconnectedTarget, message, brokerReceivedAt);
+            this.completeSocketDelivery(socket, currentKey, fromSession.scopeId, liveMailboxTarget, message, fingerprint);
+            break;
           }
-          if (message.replyTo) {
-            this.askEdges.delete(message.replyTo);
-            this.removePendingAskRecord(message.replyTo, fromSession.scopeId);
-          }
-          this.recordDelivery(currentKey, message.id, fingerprint, liveMailboxTarget ? "socket_delivered" : "queued");
-          this.writeDeliverySuccess(socket, message.id, liveMailboxTarget ? "socket_delivered" : "queued");
+          this.queueMailboxMessage(fromSession, disconnectedTarget, message, brokerReceivedAt);
+          this.releaseReplyEdge(message.replyTo, fromSession.scopeId);
+          this.recordDelivery(currentKey, message.id, fingerprint, "queued");
+          this.writeDeliverySuccess(socket, message.id, "queued");
           break;
         }
 
@@ -822,6 +911,9 @@ class IntercomBroker {
         const route = this.messageReceiptRoutes.get(clientMessage.receipt.messageId);
         const receiver = this.sessions.get(currentKey);
         const sender = route ? this.sessions.get(route.from) : undefined;
+        if (route?.to === currentKey && receiver?.socket === socket && RECEIPT_PROOF_STATUSES.has(clientMessage.receipt.status)) {
+          this.confirmPendingReceipt(this.deliveryRecordKey(route.from, clientMessage.receipt.messageId), socket);
+        }
         if (route?.to === currentKey && receiver?.socket === socket && sender) {
           writeMessage(sender.socket, {
             type: "message_receipt",
@@ -1057,16 +1149,94 @@ class IntercomBroker {
     });
   }
 
-  private writeDeliverySuccess(socket: net.Socket, messageId: string, delivery: "socket_delivered" | "queued"): void {
-    writeMessage(socket, { type: "delivered", messageId, delivery, retryable: false, outcomeKnown: true });
+  private writeDeliverySuccess(socket: net.Socket, messageId: string, delivery: "socket_delivered" | "queued", demoted?: "late_reply"): void {
+    writeMessage(socket, { type: "delivered", messageId, delivery, retryable: false, outcomeKnown: true, ...(demoted ? { demoted } : {}) });
   }
 
   private writeDeliveryFailure(socket: net.Socket, messageId: string, reason: string, code: string, retryable = false): void {
     writeMessage(socket, { type: "delivery_failed", messageId, reason, delivery: "failed", code, retryable, outcomeKnown: true });
   }
 
-  private deliveryFingerprint(message: Message, targetId: string): string {
-    return messageDeliveryFingerprint(message, targetId);
+  private releaseReplyEdge(replyTo: string | undefined, scopeId: string | undefined): void {
+    if (!replyTo) return;
+    this.askEdges.delete(replyTo);
+    this.removePendingAskRecord(replyTo, scopeId);
+  }
+
+  // A reply whose ask is gone (expired, cancelled, or already answered) still carries
+  // content the asker wants. When this broker delivered that ask from the target to this
+  // sender, deliver the reply as a plain message. Without replyTo it cannot resolve a
+  // waiter or trigger a "replies"-mode turn, so it is no stronger than a plain send.
+  private demoteLateReply(message: Message, fromKey: string, targetKey: string): boolean {
+    const replyTo = message.replyTo!;
+    const route = this.messageReceiptRoutes.get(replyTo);
+    if (!route?.expectsReply || route.from !== targetKey || route.to !== fromKey) return false;
+    delete message.replyTo;
+    message.lateReplyTo = replyTo;
+    return true;
+  }
+
+  // A receiver that promised receipts must confirm before the sender hears "delivered":
+  // a socket whose process died still accepts writes.
+  private completeSocketDelivery(senderSocket: net.Socket, fromKey: string, scopeId: string | undefined, target: ConnectedSession, message: Message, fingerprint: string): void {
+    const key = this.deliveryRecordKey(fromKey, message.id);
+    const demoted = message.lateReplyTo ? "late_reply" : undefined;
+    this.recordDelivery(fromKey, message.id, fingerprint, target.acknowledgesReceipts ? "unknown" : "socket_delivered");
+    if (demoted) this.deliveryRecords.get(key)!.demoted = demoted;
+    if (!target.acknowledgesReceipts) {
+      this.releaseReplyEdge(message.replyTo, scopeId);
+      this.writeDeliverySuccess(senderSocket, message.id, "socket_delivered", demoted);
+      return;
+    }
+    const timer = setTimeout(() => {
+      this.failPendingReceipt(key, `Receiver did not confirm receipt within ${RECEIPT_TIMEOUT_MS}ms`, "E_RECEIPT_TIMEOUT");
+    }, RECEIPT_TIMEOUT_MS);
+    timer.unref();
+    this.pendingReceipts.set(key, {
+      senderSocket,
+      fromKey,
+      messageId: message.id,
+      targetSocket: target.socket,
+      ...(scopeId ? { scopeId } : {}),
+      ...(message.replyTo ? { replyTo: message.replyTo } : {}),
+      ...(demoted ? { demoted } : {}),
+      timer,
+    });
+  }
+
+  private confirmPendingReceipt(key: string, receiverSocket: net.Socket): void {
+    const pending = this.pendingReceipts.get(key);
+    if (!pending || pending.targetSocket !== receiverSocket) return;
+    clearTimeout(pending.timer);
+    this.pendingReceipts.delete(key);
+    // A cancel or supersede may already have settled the record while the receipt was in flight.
+    if (this.deliveryRecords.get(key)?.state === "unknown") {
+      this.updateDeliveryRecord(pending.fromKey, pending.messageId, "socket_delivered");
+    }
+    // Release the answered ask only now, so a retry of an unconfirmed reply still matches it.
+    this.releaseReplyEdge(pending.replyTo, pending.scopeId);
+    if (pending.senderSocket.writable) this.writeDeliverySuccess(pending.senderSocket, pending.messageId, "socket_delivered", pending.demoted);
+  }
+
+  private failPendingReceipt(key: string, reason: string, code: string): void {
+    const pending = this.pendingReceipts.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    this.pendingReceipts.delete(key);
+    // An unconfirmed ask keeps its edge, so a receiver that was only slow can still
+    // reply. pruneAskEdges expires it after the ask timeout if no reply comes.
+    if (pending.senderSocket.writable) {
+      writeMessage(pending.senderSocket, { type: "delivery_failed", messageId: pending.messageId, reason, delivery: "unknown", code, retryable: true, outcomeKnown: false });
+    }
+  }
+
+  private settlePendingReceiptsForSocket(socket: net.Socket): void {
+    for (const [key, pending] of this.pendingReceipts) {
+      // A closed sender socket is unwritable, so this reason only ever reaches a live sender.
+      if (pending.targetSocket === socket || pending.senderSocket === socket) {
+        this.failPendingReceipt(key, "Receiver disconnected before confirming receipt", "E_RECEIVER_DISCONNECTED");
+      }
+    }
   }
 
   private deliveryRecordKey(fromSessionId: string, messageId: string): string {
@@ -1075,17 +1245,29 @@ class IntercomBroker {
 
   private replayOrReject(socket: net.Socket, fromSessionId: string, messageId: string, fingerprint: string): boolean {
     this.pruneDeliveryRecords();
-    const record = this.deliveryRecords.get(this.deliveryRecordKey(fromSessionId, messageId));
+    const key = this.deliveryRecordKey(fromSessionId, messageId);
+    const record = this.deliveryRecords.get(key);
     if (!record) return false;
     if (record.fingerprint !== fingerprint) {
       this.writeDeliveryFailure(socket, messageId, "Message id was reused with different authored content", "E_MESSAGE_ID_REUSE");
       return true;
     }
+    if (record.state === "unknown") {
+      const pending = this.pendingReceipts.get(key);
+      if (pending) {
+        // The receipt is still in flight; its outcome answers this retry.
+        pending.senderSocket = socket;
+        return true;
+      }
+      // Receivers drop duplicate message ids, so a retry of an unconfirmed delivery is safe.
+      this.deliveryRecords.delete(key);
+      return false;
+    }
     if (record.code === "E_TARGET_REBOUND" && record.retryable) {
       return false;
     }
     if (record.state === "socket_delivered" || record.state === "queued") {
-      this.writeDeliverySuccess(socket, messageId, record.state);
+      this.writeDeliverySuccess(socket, messageId, record.state, record.demoted);
     } else {
       this.writeDeliveryFailure(socket, messageId, record.reason ?? "Previous delivery failed", record.code ?? "E_DELIVERY_FAILED", record.retryable);
     }
@@ -1105,7 +1287,6 @@ class IntercomBroker {
       ...(reason ? { reason } : {}),
       ...(code ? { code } : {}),
       retryable,
-      outcomeKnown: true,
       createdAt: Date.now(),
     });
   }
@@ -1123,7 +1304,6 @@ class IntercomBroker {
     record.reason = reason;
     record.code = code;
     record.retryable = false;
-    record.outcomeKnown = true;
   }
 
   private flushMailboxForSession(session: ConnectedSession, now = Date.now()): void {
@@ -1154,6 +1334,13 @@ class IntercomBroker {
       if (!matchesId && !matchesUniqueName) {
         index += 1;
         continue;
+      }
+      // The only bulk write to one socket: pace it so a large mailbox cannot trip writeMessage's queue cap.
+      if (session.socket.writableLength >= MAX_FRAME_BYTES) {
+        session.socket.once("drain", () => {
+          if (this.sessions.get(session.key) === session) this.flushMailboxForSession(session);
+        });
+        return;
       }
 
       this.mailboxMessages.splice(index, 1);
@@ -1703,7 +1890,6 @@ class IntercomBroker {
 
   private shutdown(): void {
     console.log("Broker shutting down");
-    
     for (const session of this.sessions.values()) {
       session.socket.end();
     }
@@ -1734,4 +1920,5 @@ class IntercomBroker {
   }
 }
 
+await assertNoLiveBroker(PID_PATH);
 new IntercomBroker().start();

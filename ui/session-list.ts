@@ -1,9 +1,9 @@
 import type { Component } from "@earendil-works/pi-tui";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { SessionInfo } from "../types.ts";
 
-function middleTruncate(text: string, maxWidth: number): string {
+export function middleTruncate(text: string, maxWidth: number): string {
   if (visibleWidth(text) <= maxWidth) {
     return text;
   }
@@ -29,11 +29,11 @@ function middleTruncate(text: string, maxWidth: number): string {
   return truncateToWidth(`${left}…${right}`, maxWidth, "");
 }
 
-function shortSessionId(sessionId: string): string {
+export function shortSessionId(sessionId: string): string {
   return sessionId.slice(0, 8);
 }
 
-function herdrLocationText(session: SessionInfo): string | undefined {
+export function herdrLocationText(session: SessionInfo): string | undefined {
   const location = session.herdrLocation;
   if (!location) return undefined;
   if (location.status === "not_hosted") return "not under Herdr";
@@ -49,12 +49,18 @@ function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?
   return `${name} (${shortSessionId(session.id)})${suffix}`;
 }
 
+export interface SessionListSelection {
+  session: SessionInfo;
+  action: "message" | "handover";
+}
+
 export class SessionListOverlay implements Component {
   private theme: Theme;
   private keybindings: KeybindingsManager;
   private currentSession: SessionInfo;
-  private done: (result: SessionInfo | undefined) => void;
+  private done: (result: SessionListSelection | undefined) => void;
   private sessions: SessionInfo[];
+  private pool: string | undefined;
   private selectedIndex = 0;
   private maxVisible = 8;
 
@@ -63,20 +69,17 @@ export class SessionListOverlay implements Component {
     keybindings: KeybindingsManager,
     currentSession: SessionInfo,
     sessions: SessionInfo[],
-    done: (result: SessionInfo | undefined) => void,
+    done: (result: SessionListSelection | undefined) => void,
+    pool?: string,
   ) {
     this.theme = theme;
     this.keybindings = keybindings;
     this.currentSession = currentSession;
     this.sessions = sessions;
     this.done = done;
+    this.pool = pool;
   }
 
-  private onSessionSelect(sessionId: string): void {
-    const session = this.sessions.find(s => s.id === sessionId);
-    if (!session) return;
-    this.done(session);
-  }
 
   invalidate(): void {}
 
@@ -100,11 +103,12 @@ export class SessionListOverlay implements Component {
       return;
     }
 
+    const session = this.sessions[this.selectedIndex];
+    if (!session) return;
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      const session = this.sessions[this.selectedIndex];
-      if (session) {
-        this.onSessionSelect(session.id);
-      }
+      this.done({ session, action: "message" });
+    } else if (matchesKey(data, "h")) {
+      this.done({ session, action: "handover" });
     }
   }
 
@@ -115,7 +119,7 @@ export class SessionListOverlay implements Component {
     }
 
     const contentWidth = Math.max(0, innerWidth - 2);
-    const footer = `${this.keybindings.getKeys("tui.select.confirm").join("/")}: Message • ${this.keybindings.getKeys("tui.select.cancel").join("/")}: Close`;
+    const footer = `${this.keybindings.getKeys("tui.select.confirm").join("/")}: Message • h: Hand over • ${this.keybindings.getKeys("tui.select.cancel").join("/")}: Close`;
     const border = (text: string) => this.theme.fg("accent", text);
     const row = (text = "") => {
       const clipped = truncateToWidth(text, contentWidth, "", true);
@@ -124,16 +128,17 @@ export class SessionListOverlay implements Component {
 
     const lines: string[] = [];
     lines.push(border(`╭${"─".repeat(contentWidth)}╮`));
-    lines.push(row(this.theme.bold(" Current Session")));
+    lines.push(row(this.theme.bold(" Current session")));
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
     lines.push(row());
     lines.push(row(`  ${this.theme.fg("dim", sessionTitle(this.currentSession, { self: true }))}`));
     lines.push(row(`  ${this.theme.fg("dim", `${middleTruncate(this.currentSession.cwd, Math.max(8, contentWidth - 4))} • ${this.currentSession.model}`)}`));
     const currentHerdrLocation = herdrLocationText(this.currentSession);
     if (currentHerdrLocation) lines.push(row(`  ${this.theme.fg("dim", currentHerdrLocation)}`));
+    if (this.pool) lines.push(row(`  ${this.theme.fg("dim", `Pool: ${this.pool}`)}`));
     lines.push(row());
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
-    lines.push(row(this.theme.bold(" Other Sessions")));
+    lines.push(row(this.theme.bold(" Other sessions")));
     lines.push(row());
 
     if (this.sessions.length === 0) {

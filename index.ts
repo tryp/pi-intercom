@@ -1,14 +1,15 @@
-import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BorderedLoader, defineTool, VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import { Type } from "typebox";
 import { Text } from "@earendil-works/pi-tui";
-import { IntercomClient, type SendResult } from "./broker/client.ts";
+import { IntercomClient, IntercomSessionHeldError, type SendResult } from "./broker/client.ts";
 import { spawnBrokerIfNeeded } from "./broker/spawn.ts";
-import { SessionListOverlay } from "./ui/session-list.ts";
+import { SessionListOverlay, type SessionListSelection } from "./ui/session-list.ts";
+import { HandoverPicker, type HandoverPickerResult, type RemoteSessionLister } from "./ui/handover-picker.ts";
 import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
 import { InlineMessageComponent } from "./ui/inline-message.ts";
-import { getAskTimeoutMs, loadConfig, type IntercomConfig } from "./config.ts";
+import { getAskTimeoutMs, getIntercomScopeId, loadConfig, setIntercomScopeId, type IntercomConfig } from "./config.ts";
 import { EXTENSION_BUS_FEATURE } from "./types.ts";
 import type { Attachment, BrokerMessage, Message, MessageControl, MessageReceiptStatus, SessionInfo, SessionRegistration } from "./types.ts";
 import {
@@ -29,13 +30,16 @@ import {
   type IntercomSessionIdentityRequestV1,
 } from "./extension-api.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
-import { resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
+import { join as joinPath, resolve as resolvePath } from "node:path";
 import { sameCwd } from "./cwd.ts";
 import { formatContextUsage } from "./format-context.ts";
 import { openProjectPane, resolveTargetInCwd, waitForProjectSession, type ProjectPaneLaunch } from "./project-agent.ts";
 import { relaySenderName } from "./cross-machine-envelope.ts";
-import { sendCrossMachine } from "./cross-machine-transport.ts";
-import { parseCrossMachineTarget } from "./cross-machine-discovery.ts";
+import { runCommand, sendCrossMachine } from "./cross-machine-transport.ts";
+import { listMachineAgents, listSavedMachines, parseCrossMachineTarget } from "./cross-machine-discovery.ts";
+import { formatHandoverMessage, generateHandoverBody, readGitState } from "./handover.ts";
+import { isIdleWakePending, releaseIdleWake, reserveIdleWake } from "./idle-wake.ts";
 
 const INTERCOM_TOOL_NAME = "intercom";
 const SUBAGENT_CONTROL_INTERCOM_EVENT = "subagent:control-intercom";
@@ -76,6 +80,45 @@ interface DeliveryTarget {
   label: string;
   projectPane?: ProjectPaneLaunch;
 }
+
+interface DeliveryRequest {
+  to?: string;
+  cwd?: string;
+  openProjectPaneIfMissing?: boolean;
+  focus?: boolean;
+  message: string;
+  attachments?: Attachment[];
+  replyTo?: string;
+  supersedes?: string;
+  retryOf?: string;
+  /** Handovers are always new messages and are not sent once the signal aborts. */
+  handover?: boolean;
+  noWake?: boolean;
+}
+
+interface IntercomToolResult {
+  content: Array<{ type: "text"; text: string }>;
+  details: Record<string, unknown>;
+}
+
+/** `rawTo` is the string the caller addressed; pass "" to disable the name-prefix fallback. */
+interface PrefixTarget {
+  rawTo: string;
+  firstTarget: string;
+  display: string;
+}
+
+interface PrefixSend {
+  result: SendResult;
+  /** The resolved session name after a prefix retry, otherwise the caller's display. */
+  display: string;
+  /** ` ("<raw>" resolved to "<name>")` after a prefix retry, otherwise "". */
+  resolution: string;
+  /** Set when the broker refused the raw target and no connected name starts with it. */
+  noMatchText?: string;
+}
+
+const BLOCKING_ASK_GUIDANCE = "Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.";
 
 interface OutboxTarget {
   id: string;
@@ -129,34 +172,25 @@ function inferAction(params: {
   cwd?: string;
 }): "list" | "list-cwd" | "send" | "ask" | "reply" | "pending" | "status" | "cancel" {
   const { to, message, messageId, cwd } = params;
-
-  // messageId present → cancel
   if (messageId) return "cancel";
-
-  // message + target → send (most common case)
   if (message && (to || cwd)) return "send";
-
-  // message without target → reply (if there's a pending ask) or send (if only one peer)
-  // We can't check replyTracker here, so default to "send" — the send handler
-  // will infer reply from pending asks.
   if (message && !to && !cwd) return "send";
-
-  // cwd without message → list-cwd
   if (cwd && !message) return "list-cwd";
-
-  // Default: list sessions
   return "list";
 }
 
-export function explicitCrossMachineSendRestriction(options: {
-  to?: string;
-  cwd?: string;
-  openProjectPaneIfMissing?: boolean;
-  attachments?: readonly unknown[];
-  replyTo?: string;
-  supersedes?: string;
-  retryOf?: string;
-}): string | undefined {
+// Pi 1.2.0 runs before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581) and marks
+// the session busy as soon as such a run starts. An unparseable version counts as older Pi.
+function triggerTurnRunsPromptLifecycle(piVersion: string): boolean {
+  const match = /^(\d+)\.(\d+)\./.exec(piVersion);
+  if (!match) return false;
+  const major = Number(match[1]);
+  return major > 1 || (major === 1 && Number(match[2]) >= 2);
+}
+
+export function explicitCrossMachineSendRestriction(
+  options: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing" | "replyTo" | "supersedes" | "retryOf" | "noWake"> & { attachments?: readonly unknown[] },
+): string | undefined {
   if (!options.to?.includes("@")) return undefined;
   if (options.cwd || options.openProjectPaneIfMissing) {
     return "Cross-machine send does not support cwd or opening project panes.";
@@ -164,8 +198,34 @@ export function explicitCrossMachineSendRestriction(options: {
   if (options.replyTo || options.supersedes || options.retryOf || options.attachments?.length) {
     return "Cross-machine send only supports a new text message; attachments, reply relationships, supersede, and retry are not supported.";
   }
+  if (options.noWake) {
+    return "Cross-machine send does not support noWake; the receiver always wakes. Send it without noWake.";
+  }
   return undefined;
 }
+
+// An unconfirmed outcome must not read as a failure: the receiver may still have the message.
+function undeliveredText(target: string, result: SendResult): string {
+  const reason = result.reason ?? "Session may not exist or has disconnected.";
+  return result.outcomeKnown
+    ? `Message to "${target}" was not delivered: ${reason}`
+    : `Delivery to "${target}" could not be confirmed: ${reason}. The message may still arrive, so sending it again could duplicate it.`;
+}
+
+function queuedText(target: string, what = "message"): string {
+  return `Session "${target}" is not connected. The ${what} is waiting in the broker mailbox until that session reconnects.`;
+}
+
+// The broker words "no open ask" ("a pending ask") differently from "an open ask between other sessions" ("the pending ask").
+function isClosedAskReply(result: SendResult): boolean {
+  return result.code === "E_REPLY_TARGET" && result.reason === "Reply target does not match a pending ask";
+}
+
+function closedAskText(target: string): string {
+  return `Reply to "${target}" was not delivered: the broker can no longer match it to an open ask, for example because the asker disconnected or the broker restarted. To deliver the content, send it as a new message without replyTo: intercom({ action: "send", to: "${target}", message: "..." }).`;
+}
+
+const LATE_REPLY_NOTE = "The ask was no longer open, so the reply was delivered as a regular message.";
 
 function deliveryDetails(result: SendResult): Record<string, unknown> {
   return {
@@ -176,6 +236,7 @@ function deliveryDetails(result: SendResult): Record<string, unknown> {
     outcomeKnown: result.outcomeKnown,
     ...(result.code ? { code: result.code } : {}),
     ...(result.reason ? { reason: result.reason } : {}),
+    ...(result.demoted ? { demoted: result.demoted } : {}),
   };
 }
 
@@ -617,6 +678,9 @@ function previewText(value: unknown, maxLength = 72): string | undefined {
   }
   return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 1)}…` : normalized;
 }
+function expandHomePath(path: string): string {
+  return path === "~" ? homedir() : path.startsWith("~/") ? joinPath(homedir(), path.slice(2)) : path;
+}
 function firstTextContent(result: { content?: Array<{ type: string; text?: string }> }): string {
   return result.content?.find((item) => item.type === "text" && typeof item.text === "string")?.text?.replace(/\*\*/g, "") ?? "";
 }
@@ -628,6 +692,8 @@ function formatInboundDeliveryMetadata(message: Message): string {
   if (typeof message.senderSequence === "number") parts.push(`seq ${message.senderSequence}`);
   if (message.supersedes) parts.push(`supersedes ${message.supersedes}`);
   if (message.retryOf) parts.push(`retry of ${message.retryOf}`);
+  if (message.lateReplyTo) parts.push(`late reply to ${message.lateReplyTo}`);
+  if (message.noWake) parts.push("sent without waking you");
   const sentAt = formatMessageTimestamp(message.timestamp);
   if (sentAt) parts.push(`sent ${sentAt}`);
   const brokerDeliveredAt = formatMessageTimestamp(message.brokerDeliveredAt);
@@ -648,8 +714,9 @@ function getNamePollMs(): number {
   }
   return 1000;
 }
-export default function piIntercomExtension(pi: ExtensionAPI) {
+export default function piIntercomExtension(pi: ExtensionAPI, piVersion = VERSION) {
   let client: IntercomClient | null = null;
+  const wakeWithTriggerTurn = triggerTurnRunsPromptLifecycle(piVersion);
   const config: IntercomConfig = loadConfig();
   const askTimeoutMs = getAskTimeoutMs();
   const localExtensions = new Map<string, {
@@ -672,6 +739,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let reconnectPromiseGeneration: number | null = null;
   let startupConnectTimer: NodeJS.Timeout | null = null;
   let reconnectAttempt = 0;
+  // Retrying a held session id cannot succeed until its holder exits, so background reconnects stop
+  // until the next session start (/reload) or a successful manual connect.
+  let sessionHeldBlocked = false;
   let shuttingDown = false;
   let disposed = true;
   let runtimeStarted = false;
@@ -848,12 +918,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       // The UI can disappear during session shutdown/reload while async overlay work is settling.
     }
   }
-  function notifyAliasCommand(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error", generation = runtimeGeneration): void {
+  function notifyCommand(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error", generation = runtimeGeneration): void {
     const liveContext = getLiveContext(ctx, generation);
     if (!liveContext) return;
     if (!liveContext.hasUI) {
       // Command handlers return void and print mode supplies a no-op UI. Keep
-      // alias guidance visible without injecting a synthetic Pi message.
+      // command output visible without injecting a synthetic Pi message.
       console.error(message);
       return;
     }
@@ -876,10 +946,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
   }
   function createExtensionChannel(namespace: string): IntercomExtensionChannel {
-    return {
+    // Stale handles (after unregister or re-registration) must not act on the namespace.
+    const liveExtension = () => {
+      const extension = localExtensions.get(namespace);
+      return extension?.channel === channel ? extension : undefined;
+    };
+    const channel: IntercomExtensionChannel = {
       namespace,
       snapshot() {
-        const extension = localExtensions.get(namespace);
+        const extension = liveExtension();
         return {
           connected: Boolean(client?.isConnected()),
           supported: Boolean(client?.supportsFeature(EXTENSION_BUS_FEATURE)),
@@ -888,11 +963,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         };
       },
       publish(payload, options = {}) {
+        const extension = liveExtension();
+        if (!extension) throw new Error(`Intercom extension channel is unregistered: ${namespace}`);
         const activeClient = client;
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        const extension = localExtensions.get(namespace);
         const ownerOnly = options.ownerOnly ?? false;
-        const ownerEpoch = ownerOnly ? extension?.owner?.epoch : undefined;
+        const ownerEpoch = ownerOnly ? extension.owner?.epoch : undefined;
         if (ownerOnly && !ownerEpoch) throw new Error(`No owner is available for ${namespace}`);
         activeClient.sendExtensionMessage({
           type: "extension_publish",
@@ -903,10 +979,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         });
       },
       commitState(payload, expectedRevision) {
+        const extension = liveExtension();
+        if (!extension) throw new Error(`Intercom extension channel is unregistered: ${namespace}`);
         const activeClient = client;
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
-        const extension = localExtensions.get(namespace);
-        const ownerEpoch = extension?.owner?.epoch;
+        const ownerEpoch = extension.owner?.epoch;
         if (!ownerEpoch || extension.owner?.sessionId !== activeClient.sessionId) {
           throw new Error(`Current session is not the owner of ${namespace}`);
         }
@@ -923,7 +1000,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (!activeClient?.isConnected()) throw new Error("Intercom is not connected");
         return activeClient.listSessions();
       },
+      unregister() {
+        if (!liveExtension()) return;
+        localExtensions.delete(namespace);
+        const activeClient = client;
+        // Offline or on an older broker there is nothing to withdraw: the
+        // capability list is rebuilt from localExtensions on the next register.
+        if (activeClient?.isConnected() && activeClient.supportsFeature(EXTENSION_BUS_FEATURE)) {
+          activeClient.updateExtensionCapabilities(currentExtensionCapabilities());
+        }
+      },
     };
+    return channel;
   }
   function currentExtensionCapabilities() {
     return [...localExtensions.values()].map(({ registration }) => ({
@@ -953,11 +1041,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       emitLocalExtensionEvent(registration.namespace, { type: "connection", connected: true, supported });
     }
   }
+  // Whether the last register frame listed any namespace: an unregister() during the handshake must still reach the broker.
+  let registrationAdvertisedExtensions = false;
   function buildRegistration(): SessionRegistration {
     const liveContext = getLiveContext();
     if (!liveContext || !currentSessionId || sessionStartedAt === null) {
       throw new Error("Intercom runtime not initialized");
     }
+    registrationAdvertisedExtensions = localExtensions.size > 0;
 
     const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId);
     const tmuxPane = currentTmuxPane();
@@ -974,6 +1065,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       ...(tmuxPane ? { tmuxPane } : {}),
       ...(herdrPaneId ? { herdrPaneId } : {}),
       ...(herdrSessionPath ? { herdrSessionPath } : {}),
+      // handleIncomingMessage confirms every message it accepts; one that lands mid-reload goes unconfirmed.
+      acknowledgesReceipts: true,
       ...(localExtensions.size > 0
         ? {
             extensions: currentExtensionCapabilities(),
@@ -1262,6 +1355,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     if (forceTrigger) {
       return true;
     }
+    if (entry.message.noWake) {
+      return false;
+    }
     if (config.inboundTrigger === "always") {
       return true;
     }
@@ -1272,6 +1368,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration, forceTrigger = false): void {
     if (runtimeStarted && !getLiveContext(runtimeContext, generation)) {
+      emitMessageReceipt(entry.message.id, "expired", "session context no longer active before injection");
       return;
     }
     const injectedMessage = { ...entry.message, injectedAt: Date.now() };
@@ -1285,6 +1382,9 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       : entry.from.name || entry.from.id.slice(0, 8);
     const replyInstruction = replyCommand ? `\n\nTo reply, use the intercom tool: ${replyCommand}` : "";
     const deliveryMetadata = formatInboundDeliveryMetadata(injectedMessage);
+    const trigger = delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger);
+    const triggerContext = trigger ? getLiveContext(runtimeContext, generation) : undefined;
+    const startTurn = wakeWithTriggerTurn && triggerContext?.isIdle() === true;
     pi.sendMessage(
       {
         customType: "intercom_message",
@@ -1292,10 +1392,14 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         display: true,
         details: deliveredEntry,
       },
-      delivery === "trigger" && shouldTriggerInboundMessage(entry, forceTrigger)
-        ? { triggerTurn: true }
-        : { deliverAs: "steer" }
+      startTurn ? { triggerTurn: true } : trigger ? undefined : { deliverAs: "steer" }
     );
+    // Pi before 1.2.0 skips before_agent_start for sendMessage({ triggerTurn: true }) turns (pi#5581),
+    // so wake an idle session there with a user prompt that runs the normal prompt lifecycle.
+    if (!wakeWithTriggerTurn && triggerContext?.isIdle() && !isIdleWakePending(triggerContext.sessionManager)) {
+      reserveIdleWake(triggerContext.sessionManager);
+      pi.sendUserMessage("New intercom message above.", { deliverAs: "steer" });
+    }
     emitMessageReceipt(injectedMessage.id, "injected");
   }
   function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
@@ -1330,7 +1434,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   function flushHeldInboundMessages(ctx: ExtensionContext, generation: number): void {
     if (!getLiveContext(ctx, generation)) return;
     if (config.busyDelivery === "human-first" && ctx.hasUI) {
-      if (ctx.isIdle() && heldInboundMessages.length > 0) {
+      if (ctx.isIdle() && !isIdleWakePending(ctx.sessionManager) && heldInboundMessages.length > 0) {
         deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
       }
       if (heldInboundMessages.length === 0) clearHeldInboundTimer();
@@ -1357,6 +1461,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     const messageGeneration = runtimeGeneration;
     const liveContext = getLiveContext(ctx, messageGeneration);
     if (!liveContext) {
+      emitMessageReceipt(message.id, "expired", "session context no longer active on receipt");
       return;
     }
     const receiverReceivedAt = Date.now();
@@ -1402,7 +1507,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       switch (message.type) {
         case "registered": {
           const supported = message.features?.includes(EXTENSION_BUS_FEATURE) ?? false;
-          if (supported && localExtensions.size > 0) {
+          if (supported && (localExtensions.size > 0 || registrationAdvertisedExtensions)) {
             nextClient.updateExtensionCapabilities(currentExtensionCapabilities());
           }
           for (const namespace of localExtensions.keys()) {
@@ -1476,7 +1581,11 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     });
     nextClient.on("message", (from, message) => {
       const liveContext = getLiveContext();
-      if (client !== nextClient || !liveContext) {
+      if (client !== nextClient) {
+        return;
+      }
+      if (!liveContext) {
+        emitMessageReceipt(message.id, "expired", "session context no longer active on receipt");
         return;
       }
       handleIncomingMessage(liveContext, from, message);
@@ -1486,11 +1595,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         return;
       }
       rejectReplyWaiter(new Error(`Disconnected while waiting for reply: ${error.message}`, { cause: error }));
-      for (const [namespace, extension] of localExtensions) {
-        extension.owner = undefined;
-        emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
-        emitLocalExtensionEvent(namespace, { type: "owner" });
-      }
+      markLocalExtensionsDisconnected();
       client = null;
       if (!shuttingDown && !disposed) {
         clearReconnectTimer();
@@ -1501,8 +1606,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       // Keep broker/socket noise out of the TUI. Reconnect logic runs from the disconnect path.
     });
   }
+  function markLocalExtensionsDisconnected(): void {
+    for (const [namespace, extension] of localExtensions) {
+      extension.owner = undefined;
+      emitLocalExtensionEvent(namespace, { type: "connection", connected: false, supported: false });
+      emitLocalExtensionEvent(namespace, { type: "owner" });
+    }
+  }
   function scheduleReconnect(): void {
-    if (disposed || shuttingDown || reconnectTimer || reconnectPromise || !getLiveContext()) {
+    if (disposed || shuttingDown || sessionHeldBlocked || reconnectTimer || reconnectPromise || !getLiveContext()) {
       return;
     }
     const scheduledGeneration = runtimeGeneration;
@@ -1516,6 +1628,18 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         // ensureConnected("background") already queued the next retry.
       });
     }, getReconnectDelayMs());
+  }
+  function reportSessionHeld(ctx: ExtensionContext, generation: number, error: IntercomSessionHeldError): void {
+    if (sessionHeldBlocked || !getLiveContext(ctx, generation)) return;
+    sessionHeldBlocked = true;
+    const message = `Intercom is offline: session id ${currentIntercomSessionId} is held by process ${error.holder.pid} in ${error.holder.cwd}. Close that session and run /reload, or give this session its own PI_INTERCOM_STABLE_ID.`;
+    notifyIfLive(ctx, message, "warning", generation);
+    pi.appendEntry("intercom_session_held", {
+      sessionId: currentIntercomSessionId,
+      holder: error.holder,
+      error: error.message,
+      timestamp: Date.now(),
+    });
   }
   async function ensureConnected(reason: "startup" | "background" | "tool" | "overlay"): Promise<IntercomClient> {
     if (!config.enabled) {
@@ -1540,6 +1664,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       const nextClient = new IntercomClient();
       client = nextClient;
       attachClientHandlers(nextClient);
+      let retryAfterFailure = false;
       try {
         await spawnBrokerIfNeeded(config.brokerCommand, config.brokerArgs);
         await nextClient.connect(buildRegistration(), currentIntercomSessionId ?? currentSessionId);
@@ -1549,19 +1674,25 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         }
         client = nextClient;
         reconnectAttempt = 0;
+        sessionHeldBlocked = false;
         return nextClient;
       } catch (error) {
         if (client === nextClient) {
           client = null;
         }
-        if (reason === "background" && getLiveContext(contextAtStart, generationAtStart)) {
-          scheduleReconnect();
+        if (error instanceof IntercomSessionHeldError) {
+          reportSessionHeld(contextAtStart, generationAtStart, error);
         }
+        retryAfterFailure = reason === "background";
         throw toError(error);
       } finally {
         if (reconnectPromise === nextReconnectPromise) {
           reconnectPromise = null;
           reconnectPromiseGeneration = null;
+        }
+        // scheduleReconnect() skips while reconnectPromise is set, so queue the retry only after clearing it.
+        if (retryAfterFailure && getLiveContext(contextAtStart, generationAtStart)) {
+          scheduleReconnect();
         }
       }
     })();
@@ -1594,6 +1725,96 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       throw new Error(`Multiple sessions match ID prefix "${nameOrId}". Use a longer session ID prefix.`);
     }
     return null;
+  }
+  /**
+   * Sends to `firstTarget` and, only when that is the raw unresolved string and the broker answered
+   * E_TARGET_NOT_FOUND for it, retries once with the unique connected session whose name starts with
+   * it. Raw-first lets the broker queue for (send) or refuse (ask) an offline session addressed by its
+   * exact name before a connected session whose name merely extends it can capture the message.
+   * `attempt` must use a fresh message id per call. Throws when several connected names share the prefix.
+   */
+  async function sendWithNamePrefixFallback(activeClient: IntercomClient, target: PrefixTarget, attempt: (target: string) => Promise<SendResult>): Promise<PrefixSend> {
+    const { rawTo, firstTarget, display } = target;
+    const result = await attempt(firstTarget);
+    if (result.delivered || firstTarget !== rawTo || result.code !== "E_TARGET_NOT_FOUND") {
+      return { result, display, resolution: "" };
+    }
+    const sessions = await activeClient.listSessions();
+    const lowerName = rawTo.toLowerCase();
+    const byNamePrefix = sessions.filter(s => s.name?.toLowerCase().startsWith(lowerName) ?? false);
+    if (byNamePrefix.length > 1) {
+      const prefixes = sessionIdPrefixes(sessions);
+      const candidates = byNamePrefix.map((session) => `"${session.name}" (${prefixes.get(session.id)!})`).join(", ");
+      throw new Error(`Multiple session names start with "${rawTo}": ${candidates}. Use the full name or the id shown in parentheses by "list".`);
+    }
+    const match = byNamePrefix[0];
+    if (!match || match.id === activeClient.sessionId) {
+      return { result, display, resolution: "", noMatchText: describeNoSessionMatch(sessions, rawTo) };
+    }
+    return { result: await attempt(match.id), display: match.name!, resolution: ` ("${rawTo}" resolved to "${match.name}")` };
+  }
+  /** Blocking variant: each attempt registers its reply waiter before sending and releases it when refused, so a retry can register its own. */
+  async function askWithNamePrefixFallback(activeClient: IntercomClient, target: PrefixTarget, payload: Omit<Parameters<IntercomClient["send"]>[1], "messageId" | "expectsReply">, wait: {
+    signal: AbortSignal | undefined;
+    onAttempt: (askId: string) => void;
+    deliveryState: () => string;
+  }): Promise<PrefixSend & { reply: Promise<Message> }> {
+    let reply!: Promise<Message>;
+    const sent = await sendWithNamePrefixFallback(activeClient, target, async (attemptTo) => {
+      // The listSessions round trip before a retry can outlive an abort; never send an ask nobody can cancel.
+      if (wait.signal?.aborted) {
+        throw new Error("Cancelled");
+      }
+      const askId = randomUUID();
+      wait.onAttempt(askId);
+      reply = waitForReply(attemptTo, askId, wait.signal, () => activeClient.cancelAsk(askId), wait.deliveryState);
+      reply.catch(() => undefined);
+      const result = await activeClient.send(attemptTo, { ...payload, messageId: askId, expectsReply: true });
+      if (!result.delivered) {
+        rejectReplyWaiter(new Error(undeliveredText(attemptTo, result)));
+        await reply.catch(() => undefined);
+      }
+      return result;
+    });
+    return { ...sent, reply };
+  }
+  function editDistance(a: string, b: string): number {
+    let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+    for (let i = 1; i <= a.length; i++) {
+      const row = [i];
+      for (let j = 1; j <= b.length; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        row.push(Math.min(row[j - 1]! + 1, previous[j]! + 1, previous[j - 1]! + cost));
+      }
+      previous = row;
+    }
+    return previous[b.length]!;
+  }
+  function nearestSessionName(sessions: SessionInfo[], to: string): SessionInfo | null {
+    const needle = to.toLowerCase();
+    let best: SessionInfo | null = null;
+    let bestDistance = Number.POSITIVE_INFINITY;
+    for (const session of sessions) {
+      if (!session.name) {
+        continue;
+      }
+      const candidate = session.name.toLowerCase();
+      const limit = Math.max(2, Math.floor(Math.max(candidate.length, needle.length) / 4));
+      const distance = editDistance(candidate, needle);
+      if (distance <= limit && distance < bestDistance) {
+        best = session;
+        bestDistance = distance;
+      }
+    }
+    return best;
+  }
+  function describeNoSessionMatch(sessions: SessionInfo[], to: string): string {
+    const nearest = nearestSessionName(sessions, to);
+    if (nearest?.name) {
+      const prefixes = sessionIdPrefixes(sessions);
+      return `No connected session matches "${to}". Nearest name: "${nearest.name}" (${prefixes.get(nearest.id)!}). Run intercom list and address the session by its full name or the id shown in parentheses.`;
+    }
+    return `No connected session matches "${to}". Run intercom list for connected sessions.`;
   }
   async function resolveSupervisorTarget(activeClient: IntercomClient, metadata: ChildOrchestratorMetadata): Promise<string | null> {
     if (metadata.orchestratorSessionId) {
@@ -1634,7 +1855,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return { id: existing.session.id, label: options.to || existing.session.name || existing.session.id };
     }
     if (!options.openProjectPaneIfMissing) {
-      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} Pass openProjectPaneIfMissing: true to open a Herdr project pane and start Pi there.`);
+      throw new Error(`${existing.reason ?? `No intercom session is connected in ${targetCwd}.`} If the user wants a long-lived peer there in its own Herdr pane, pass openProjectPaneIfMissing: true; otherwise tell the user no session is running there.`);
     }
 
     const beforeSessionIds = new Set(sessions.map((session) => session.id));
@@ -1647,6 +1868,206 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       signal: options.signal,
     });
     return { id: session.id, label: session.name || session.id, projectPane };
+  }
+  /** Shared by send, handover, and /handover. Never throws; failures are returned as error results. */
+  async function deliverMessage(
+    connectedClient: IntercomClient,
+    ctx: ExtensionContext,
+    signal: AbortSignal | undefined,
+    request: DeliveryRequest,
+  ): Promise<IntercomToolResult> {
+    const { to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, noWake } = request;
+    try {
+      const crossMachineTarget = Boolean(to?.includes("@"));
+      const crossMachineRestriction = explicitCrossMachineSendRestriction({
+        to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf, noWake,
+      });
+      if (crossMachineRestriction) {
+        return {
+          content: [{ type: "text", text: crossMachineRestriction }],
+          details: { error: true, crossMachine: false },
+        };
+      }
+      if (crossMachineTarget) {
+        try {
+          parseCrossMachineTarget(to!);
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: getErrorMessage(error) }],
+            details: { error: true, crossMachine: false },
+          };
+        }
+      }
+      if (openProjectPaneIfMissing && !cwd) {
+        return {
+          content: [{ type: "text", text: "openProjectPaneIfMissing requires a target cwd." }],
+          details: { error: true },
+        };
+      }
+      const confirmSend = !replyTo && config.confirmSend && ctx.hasUI;
+      const attachmentText = attachments?.length ? formatAttachments(attachments) : "";
+      if (confirmSend && cwd && openProjectPaneIfMissing) {
+        const confirmed = await ctx.ui.confirm(
+          "Send message",
+          `Send to "${to ?? cwd}":\n\n${message}${attachmentText}`,
+        );
+        if (!confirmed) {
+          return {
+            content: [{ type: "text", text: "Message cancelled by user" }],
+            details: {},
+          };
+        }
+      }
+      if (confirmSend && crossMachineTarget) {
+        const confirmed = await ctx.ui.confirm("Send message", `Send to "${to}":\n\n${message}`);
+        if (!confirmed) {
+          return {
+            content: [{ type: "text", text: "Message cancelled by user" }],
+            details: {},
+          };
+        }
+      }
+      if (crossMachineTarget) {
+        if (request.handover && signal?.aborted) {
+          return { content: [{ type: "text", text: "Handover was cancelled before delivery." }], details: { error: true } };
+        }
+        const identity = buildPresenceIdentity(pi, connectedClient.sessionId ?? ctx.sessionManager.getSessionId());
+        try {
+          const remote = await sendCrossMachine(to!, message, {
+            name: identity.name,
+            sessionId: connectedClient.sessionId ?? ctx.sessionManager.getSessionId(),
+            machine: config.crossMachine.machineName,
+          }, {
+            remoteCommand: config.crossMachine.remoteCommand,
+          });
+          const remoteTarget = relaySenderName({ name: remote.agent.name, machine: remote.machine.label });
+          pi.appendEntry("intercom_sent", {
+            to: remoteTarget,
+            message: { text: message },
+            timestamp: Date.now(),
+            crossMachine: true,
+          });
+          return {
+            content: [{ type: "text", text: `Message sent to ${remoteTarget} over SSH (origin identity is SSH-asserted)` }],
+            details: { delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name, trust: "ssh-asserted" },
+          };
+        } catch (remoteError) {
+          return {
+            content: [{ type: "text", text: `Explicit cross-machine message to "${to}" was not delivered: ${getErrorMessage(remoteError)}` }],
+            details: { error: true, crossMachine: false },
+          };
+        }
+      }
+      const target: DeliveryTarget = cwd
+        ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal })
+        : { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
+      const sendTo = target.id;
+      const targetDisplay = target.projectPane ? target.label : to ?? target.label;
+      if (sendTo === connectedClient.sessionId) {
+        return {
+          content: [{ type: "text", text: "Cannot message the current session" }],
+          details: { error: true },
+        };
+      }
+      const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
+      if (activeReplyMismatch) {
+        const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
+        return {
+          content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Use intercom({ action: "reply", message: "..." }) or set replyTo: "${activeReplyMismatch.message.id}". Refusing non-reply send to "${targetDisplay}" to avoid a misdirected reply.` }],
+          details: { error: true, replyTo: activeReplyMismatch.message.id },
+        };
+      }
+      const inferredAsk = replyTo || request.handover ? null : replyTracker.findUniquePendingAskFrom(sendTo);
+      const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
+      if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
+        const confirmed = await ctx.ui.confirm(
+          "Send message",
+          `Send to "${targetDisplay}":\n\n${message}${attachmentText}`,
+        );
+        if (!confirmed) {
+          return {
+            content: [{ type: "text", text: "Message cancelled by user" }],
+            details: {},
+          };
+        }
+      }
+      if (request.handover && signal?.aborted) {
+        return { content: [{ type: "text", text: "Handover was cancelled before delivery." }], details: { error: true } };
+      }
+      const { result, display, resolution, noMatchText } = await sendWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, (attemptTo) => connectedClient.send(attemptTo, {
+        text: message,
+        attachments,
+        replyTo: effectiveReplyTo,
+        supersedes,
+        retryOf,
+        // A reply, explicit or inferred, answers a waiting asker, so it always wakes.
+        ...(noWake && !effectiveReplyTo ? { noWake: true } : {}),
+      }));
+      if (!result.delivered) {
+        if (effectiveReplyTo && isClosedAskReply(result)) {
+          dismissIncomingAsk(effectiveReplyTo);
+          return {
+            content: [{ type: "text", text: closedAskText(display) }],
+            details: { ...deliveryDetails(result), error: true },
+          };
+        }
+        return {
+          content: [{ type: "text", text: noMatchText ?? `${undeliveredText(display, result)}${resolution}` }],
+          details: { ...deliveryDetails(result), ...(noMatchText ? { error: true } : {}) },
+        };
+      }
+      pi.appendEntry("intercom_sent", {
+        to: display,
+        message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
+        messageId: result.id,
+        timestamp: Date.now(),
+      });
+      if (effectiveReplyTo) {
+        dismissIncomingAsk(effectiveReplyTo);
+      }
+      return {
+        content: [{
+          type: "text",
+          text: result.delivery === "queued"
+            ? queuedText(display, inferredAsk ? "reply (inferred from pending ask)" : "message")
+            : target.projectPane
+              ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
+              : `${inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${display}${resolution}`}${result.demoted ? `. ${LATE_REPLY_NOTE}` : ""}`,
+        }],
+        details: {
+          ...deliveryDetails(result),
+          ...(effectiveReplyTo ? { replyTo: effectiveReplyTo } : {}),
+          ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
+        },
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Failed to send: ${getErrorMessage(error)}` }],
+        details: { error: true },
+      };
+    }
+  }
+  async function buildHandoverText(
+    connectedClient: IntercomClient,
+    ctx: ExtensionContext,
+    options: { goal?: string; crossMachine: boolean },
+    signal: AbortSignal | undefined,
+  ): Promise<string> {
+    const [body, git] = await Promise.all([
+      generateHandoverBody(ctx, options.goal, signal),
+      readGitState(ctx.cwd),
+    ]);
+    if (signal?.aborted) {
+      throw new Error("Handover generation was aborted.");
+    }
+    const sessionId = connectedClient.sessionId ?? ctx.sessionManager.getSessionId();
+    return formatHandoverMessage({
+      senderName: pi.getSessionName()?.trim() || sessionId.slice(0, 8),
+      senderCwd: ctx.cwd,
+      sessionFile: options.crossMachine ? undefined : ctx.sessionManager.getSessionFile(),
+      git,
+      body,
+    });
   }
   function deliverLocalSubagentRelayMessage(sender: "subagent-control" | "subagent-result", status: string, messageText: string): void {
     const liveContext = getLiveContext();
@@ -1687,6 +2108,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     runtimeGeneration += 1;
     outboxRequestIds.clear();
     reconnectAttempt = 0;
+    sessionHeldBlocked = false;
     clearReconnectTimer();
     clearStartupConnectTimer();
     clearNamePollTimer();
@@ -1727,7 +2149,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (!getLiveContext(ctx, startupGeneration)) {
           return;
         }
-        client = null;
         scheduleReconnect();
       });
     }, 0);
@@ -1783,7 +2204,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       }
 
       try {
-        const result = await activeClient.send(target, { text: parsed.message });
+        const { result } = await sendWithNamePrefixFallback(activeClient, { rawTo: parsed.to, firstTarget: target, display: parsed.to }, (attemptTo) => activeClient.send(attemptTo, { text: parsed.message }));
         if (!relayStillLive()) return;
         if (!result.delivered) {
           const error = new Error(result.reason ?? "Session may not exist or has disconnected.");
@@ -1877,7 +2298,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       if (heldInboundMessages.length === 0) clearHeldInboundTimer();
     }
   });
-  pi.on("agent_start", () => {
+  pi.on("agent_start", (_event, ctx) => {
+    releaseIdleWake(ctx.sessionManager);
     if (!getLiveContext()) {
       return;
     }
@@ -1938,10 +2360,21 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
   });
 
+  // Key by the outer CustomMessage, which the host reuses across child rebuilds.
+  const inlineMessageExpansion = new WeakMap<object, { globalExpanded: boolean; expanded: boolean }>();
   pi.registerMessageRenderer("intercom_message", (message, options, theme) => {
     const details = message.details as { from: SessionInfo; message: Message; replyCommand?: string; bodyText?: string } | undefined;
     if (!details) return undefined;
-    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded);
+    let expansionState = inlineMessageExpansion.get(message);
+    if (!expansionState) {
+      expansionState = { globalExpanded: options.expanded, expanded: options.expanded };
+      inlineMessageExpansion.set(message, expansionState);
+    } else if (expansionState.globalExpanded !== options.expanded) {
+      // Reset in the callback, even when two global changes occur before render.
+      expansionState.globalExpanded = options.expanded;
+      expansionState.expanded = options.expanded;
+    }
+    return new InlineMessageComponent(details.from, details.message, theme, details.replyCommand, details.bodyText, !options.expanded, expansionState);
   });
 
   pi.on("tool_result", (event) => {
@@ -2047,13 +2480,24 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             details: { error: true },
           };
         }
-        if (!resolvedSupervisor && reason !== "progress_update") {
-          return {
-            content: [{ type: "text", text: `Supervisor "${metadata.orchestratorTarget}" is not currently connected. Blocking requests are not queued; use a progress update or retry after the supervisor reconnects.` }],
-            details: { error: true },
-          };
-        }
-        const sendTo = resolvedSupervisor ?? metadata.orchestratorTarget;
+        // A stable supervisor id is authoritative: an unresolved one goes to the broker raw, so its
+        // mailbox lookup by id applies, and never falls back to a name-prefix guess.
+        const sendTo = resolvedSupervisor ?? metadata.orchestratorSessionId ?? metadata.orchestratorTarget;
+        const supervisorTarget: PrefixTarget = {
+          rawTo: metadata.orchestratorSessionId ? "" : metadata.orchestratorTarget,
+          firstTarget: sendTo,
+          display: metadata.orchestratorTarget,
+        };
+        const supervisorFailureText = (sent: PrefixSend, blocking: boolean) => {
+          const guidance = blocking ? " Blocking requests are not queued; use a progress update or retry after the supervisor reconnects." : "";
+          if (sent.noMatchText) {
+            return `${sent.noMatchText}${guidance}`;
+          }
+          if (blocking && (sent.result.code === "E_TARGET_DISCONNECTED" || sent.result.code === "E_TARGET_NOT_FOUND")) {
+            return `Supervisor "${metadata.orchestratorTarget}" is not currently connected.${guidance}`;
+          }
+          return `${undeliveredText(sent.display, sent.result)}${sent.resolution}`;
+        };
         if (signal?.aborted) {
           return {
             content: [{ type: "text", text: "Cancelled" }],
@@ -2070,13 +2514,13 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         if (reason === "progress_update") {
           const message = params.message as string;
           try {
-            const result = await connectedClient.send(sendTo, {
+            const sent = await sendWithNamePrefixFallback(connectedClient, supervisorTarget, (attemptTo) => connectedClient.send(attemptTo, {
               text: formatChildOrchestratorMessage("update", metadata, message),
-            });
+            }));
+            const { result } = sent;
             if (!result.delivered) {
-              const errorText = result.reason ?? "Session may not exist or has disconnected.";
               return {
-                content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
+                content: [{ type: "text", text: supervisorFailureText(sent, false) }],
                 details: deliveryDetails(result),
               };
             }
@@ -2088,7 +2532,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
               subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
             });
             return {
-              content: [{ type: "text", text: `Progress update sent to supervisor ${metadata.orchestratorTarget}` }],
+              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(metadata.orchestratorTarget, "progress update") : `Progress update sent to supervisor ${metadata.orchestratorTarget}${sent.resolution}` }],
               details: { messageId: result.id, delivered: true },
             };
           } catch (error) {
@@ -2106,20 +2550,10 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           };
         }
 
-        let replyPromise: Promise<Message> | null = null;
         let deliveryState = "created";
         let questionId: string | null = null;
         try {
-          questionId = randomUUID();
-          replyPromise = waitForReply(sendTo, questionId, signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
-          replyPromise.catch(() => undefined);
           if (signal?.aborted) {
-            rejectReplyWaiter(new Error("Cancelled"));
-            try {
-              await replyPromise;
-            } catch {
-              // The waiter was intentionally rejected above; the tool result reports cancellation.
-            }
             return {
               content: [{ type: "text", text: "Cancelled" }],
               details: { error: true },
@@ -2128,24 +2562,16 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           const requestText = reason === "interview_request"
             ? formatChildOrchestratorMessage("interview", metadata, formatSupervisorInterviewRequest(supervisorInterview!, typeof params.message === "string" ? params.message : undefined))
             : formatChildOrchestratorMessage("ask", metadata, params.message as string);
-          const sendResult = await connectedClient.send(sendTo, {
-            messageId: questionId,
-            text: requestText,
-            expectsReply: true,
+          const sent = await askWithNamePrefixFallback(connectedClient, supervisorTarget, { text: requestText }, {
+            signal,
+            onAttempt: (askId) => { questionId = askId; },
+            deliveryState: () => latestDeliveryState(questionId, deliveryState),
           });
+          const sendResult = sent.result;
           deliveryState = sendResult.delivered ? "socket_delivered" : "delivery_failed";
           if (!sendResult.delivered) {
-            const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
-            rejectReplyWaiter(new Error(`Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}`));
-            if (replyPromise) {
-              try {
-                await replyPromise;
-              } catch {
-                // The waiter was already rejected above. Keep the delivery failure as the only error here.
-              }
-            }
             return {
-              content: [{ type: "text", text: `Message to "${metadata.orchestratorTarget}" was not delivered: ${errorText}` }],
+              content: [{ type: "text", text: supervisorFailureText(sent, true) }],
               details: { error: true },
             };
           }
@@ -2160,7 +2586,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             timestamp: Date.now(),
             subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
           });
-          const replyMessage = await replyPromise;
+          const replyMessage = await sent.reply;
           const replyText = replyMessage.content.text;
           const replyAttachments = replyMessage.content.attachments?.length
             ? formatAttachments(replyMessage.content.attachments)
@@ -2174,7 +2600,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
             subagent: { runId: metadata.runId, agent: metadata.agent, index: metadata.index },
           });
           return {
-            content: [{ type: "text", text: `**Reply from supervisor:**\n${replyText}${replyAttachments}` }],
+            content: [{ type: "text", text: `**Reply from supervisor${sent.resolution}:**\n${replyText}${replyAttachments}` }],
             details: structuredReply
               ? structuredReply.value !== undefined
                 ? { structuredReply: structuredReply.value }
@@ -2183,30 +2609,25 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
           };
         } catch (error) {
           rejectReplyWaiter(toError(error));
-          if (replyPromise) {
-            try {
-              await replyPromise;
-            } catch {
-              // The waiter is cleanup-only on this path. The real failure is the one from the outer catch.
-            }
-          }
           return {
             content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
             details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
           };
         }
       },
-      renderCall(args, theme) {
+      renderCall(args, theme, context) {
         const reason = typeof args.reason === "string" ? args.reason : "contact";
-        const messagePreview = previewText(args.message, 96);
+        const messageText = context.expanded && typeof args.message === "string"
+          ? args.message
+          : previewText(args.message, 96);
         const interview = args.interview && typeof args.interview === "object" ? args.interview as { title?: unknown } : undefined;
         let text = theme.fg("toolTitle", theme.bold("contact_supervisor "));
         text += theme.fg(reason === "need_decision" ? "warning" : reason === "progress_update" ? "muted" : "accent", reason);
         if (typeof interview?.title === "string" && interview.title.trim()) {
           text += " " + theme.fg("accent", interview.title.trim());
         }
-        if (messagePreview) {
-          text += "\n  " + theme.fg("dim", messagePreview);
+        if (messageText) {
+          text += "\n  " + theme.fg("dim", messageText);
         }
         return new Text(text, 0, 0);
       },
@@ -2247,8 +2668,11 @@ Usage:
   intercom({ action: "list-cwd" })                → List sessions in the current working directory
   intercom({ action: "list-cwd", cwd: "/path" })  → List sessions in a specific directory
   intercom({ action: "send", to: "name-or-id", message: "..." })  → Send message
+  intercom({ action: "send", to: "name-or-id", message: "...", noWake: true }) → Information only: an idle receiver reads it on its next turn instead of starting one
   intercom({ action: "send", cwd: "/path", openProjectPaneIfMissing: true, message: "..." }) → Open a visible Herdr project pane when needed, then send
   intercom({ action: "ask", to: "name-or-id", message: "..." })   → Ask and wait for reply
+  intercom({ action: "handover", to: "name-or-id", message: "next task" }) → Summarize this session and hand it over; the receiver acts on it
+  intercom({ action: "handover", cwd: "/path", openProjectPaneIfMissing: true }) → Hand over to the session in that project, opening a Herdr pane when needed
   intercom({ action: "cancel", messageId: "..." })                 → Request cancellation of a sent message
   intercom({ action: "reply", message: "..." })                      → Answer an outstanding ask; use replyTo (or to) to select one when several are pending. Use send for unsolicited messages.
   intercom({ action: "pending" })                                      → List unresolved inbound asks
@@ -2257,14 +2681,14 @@ Usage:
       "Use to coordinate with other local pi sessions: list peers, send updates, ask for help, or check intercom connectivity.",
 
     parameters: Type.Object({
-      action: Type.Optional(StringEnum(["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"] as const, {
-        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'reply', 'pending', 'status', or 'cancel'. 'reply' answers an outstanding ask (active context or pending ask); it errors if none is available. Use replyTo, or to when several asks are pending, to select the ask. Use 'send' for unsolicited messages. Inferred from other parameters when omitted.",
+      action: Type.Optional(StringEnum(["list", "list-cwd", "send", "ask", "handover", "reply", "pending", "status", "cancel"] as const, {
+        description: "Action: 'list', 'list-cwd', 'send', 'ask', 'handover', 'reply', 'pending', 'status', or 'cancel'. 'handover' summarizes this session with the current model and sends it to the target, which acts on it; 'message' is the optional next task. 'reply' answers an outstanding ask; it errors if none is available. Use replyTo, or to when several asks are pending, to select the ask. Use 'send' for unsolicited messages. Inferred from other parameters when omitted.",
       })),
       to: Type.Optional(Type.String({
-        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves). For send/ask with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
+        description: "Target session: name, full session ID, or the short id shown in parentheses by 'list' (a leading ID prefix resolves; when no session has this exact name or ID, a leading name prefix shared by exactly one connected session also resolves, otherwise use the full name). For send/ask/handover with cwd, omit to target the sole live session in that cwd or the newly opened project-pane session. For 'reply', disambiguates the pending ask.",
       })),
       message: Type.Optional(Type.String({
-        description: "Message to send (for 'send', 'ask', or 'reply' action)",
+        description: "Message to send (for 'send', 'ask', or 'reply' action). For 'handover', the optional next task for the receiver.",
       })),
       attachments: Type.Optional(Type.Array(Type.Object({
         type: StringEnum(["file", "snippet", "context"] as const),
@@ -2285,13 +2709,16 @@ Usage:
         description: "Previous message ID this send/ask is a user-authored retry of. Retries always send a new message ID.",
       })),
       cwd: Type.Optional(Type.String({
-        description: "Working directory filter for 'list-cwd'. For send/ask, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
+        description: "Working directory filter for 'list-cwd'. For send/ask/handover, scopes target lookup to that directory; omit 'to' to target the sole live peer there. Absolute, or relative to the current session's cwd; '.' means the current cwd.",
       })),
       openProjectPaneIfMissing: Type.Optional(Type.Boolean({
-        description: "For send/ask with cwd, open a visible Herdr project pane and launch Pi there when no matching live session is connected.",
+        description: "For send/ask/handover with cwd, open a visible Herdr project pane and launch Pi there when no matching live session is connected.",
       })),
       focus: Type.Optional(Type.Boolean({
         description: "For openProjectPaneIfMissing, focus the new Herdr pane. Defaults to true.",
+      })),
+      noWake: Type.Optional(Type.Boolean({
+        description: "For 'send' only: true delivers the message without starting a turn in an idle receiver; it reads the message on its next turn. Use for information that needs no action or reply. Ignored when the send is a reply to an ask.",
       })),
     }),
 
@@ -2308,9 +2735,7 @@ Usage:
 
       syncPresenceIdentity(ctx.sessionManager.getSessionId());
 
-      const { action: rawAction, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus } = params;
-
-      // Infer action when omitted, based on what other parameters are present.
+      const { action: rawAction, to, message, attachments, replyTo, messageId, supersedes, retryOf, cwd, openProjectPaneIfMissing, focus, noWake } = params;
       const action = rawAction ?? inferAction({ to, message, messageId, cwd });
 
       switch (action) {
@@ -2435,159 +2860,34 @@ Usage:
               details: { error: true },
             };
           }
-          try {
-            const crossMachineTarget = Boolean(to?.includes("@"));
-            const crossMachineRestriction = explicitCrossMachineSendRestriction({
-              to, cwd, openProjectPaneIfMissing, attachments, replyTo, supersedes, retryOf,
-            });
-            if (crossMachineRestriction) {
-              return {
-                content: [{ type: "text", text: crossMachineRestriction }],
-                details: { error: true, crossMachine: false },
-              };
-            }
-            if (crossMachineTarget) {
-              try {
-                parseCrossMachineTarget(to!);
-              } catch (error) {
-                return {
-                  content: [{ type: "text", text: getErrorMessage(error) }],
-                  details: { error: true, crossMachine: false },
-                };
-              }
-            }
-            if (openProjectPaneIfMissing && !cwd) {
-              return {
-                content: [{ type: "text", text: "openProjectPaneIfMissing requires a target cwd." }],
-                details: { error: true },
-              };
-            }
-            const confirmSend = !replyTo && config.confirmSend && ctx.hasUI;
-            const attachmentText = attachments?.length ? formatAttachments(attachments) : "";
-            if (confirmSend && cwd && openProjectPaneIfMissing) {
-              const confirmed = await ctx.ui.confirm(
-                "Send message",
-                `Send to "${to ?? cwd}":\n\n${message}${attachmentText}`,
-              );
-              if (!confirmed) {
-                return {
-                  content: [{ type: "text", text: "Message cancelled by user" }],
-                  details: {},
-                };
-              }
-            }
-            if (confirmSend && crossMachineTarget) {
-              const confirmed = await ctx.ui.confirm("Send message", `Send to "${to}":\n\n${message}`);
-              if (!confirmed) {
-                return {
-                  content: [{ type: "text", text: "Message cancelled by user" }],
-                  details: {},
-                };
-              }
-            }
-            if (crossMachineTarget) {
-              const identity = buildPresenceIdentity(pi, connectedClient.sessionId ?? ctx.sessionManager.getSessionId());
-              try {
-                const remote = await sendCrossMachine(to!, message, {
-                  name: identity.name,
-                  sessionId: connectedClient.sessionId ?? ctx.sessionManager.getSessionId(),
-                  machine: config.crossMachine.machineName,
-                }, {
-                  remoteCommand: config.crossMachine.remoteCommand,
-                });
-                const remoteTarget = relaySenderName({ name: remote.agent.name, machine: remote.machine.label });
-                pi.appendEntry("intercom_sent", {
-                  to: remoteTarget,
-                  message: { text: message },
-                  timestamp: Date.now(),
-                  crossMachine: true,
-                });
-                return {
-                  content: [{ type: "text", text: `Message sent to ${remoteTarget} over SSH (origin identity is SSH-asserted)` }],
-                  details: { delivered: true, crossMachine: true, machine: remote.machine.label, target: remote.agent.name, trust: "ssh-asserted" },
-                };
-              } catch (remoteError) {
-                return {
-                  content: [{ type: "text", text: `Explicit cross-machine message to "${to}" was not delivered: ${getErrorMessage(remoteError)}` }],
-                  details: { error: true, crossMachine: false },
-                };
-              }
-            }
-            const target: DeliveryTarget = cwd
-              ? await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal })
-              : { id: await resolveSessionTarget(connectedClient, to) ?? to, label: to };
-            const sendTo = target.id;
-            const targetDisplay = target.projectPane ? target.label : to ?? target.label;
-            if (sendTo === connectedClient.sessionId) {
-              return {
-                content: [{ type: "text", text: "Cannot message the current session" }],
-                details: { error: true },
-              };
-            }
-            const activeReplyMismatch = replyTo ? null : replyTracker.findActiveReplyTargetMismatch(sendTo);
-            if (activeReplyMismatch) {
-              const senderLabel = activeReplyMismatch.from.name || activeReplyMismatch.from.id;
-              return {
-                content: [{ type: "text", text: `This turn is responding to an intercom ask from "${senderLabel}". Use intercom({ action: "reply", message: "..." }) or set replyTo: "${activeReplyMismatch.message.id}". Refusing non-reply send to "${targetDisplay}" to avoid a misdirected reply.` }],
-                details: { error: true, replyTo: activeReplyMismatch.message.id },
-              };
-            }
-            const inferredAsk = replyTo ? null : replyTracker.findUniquePendingAskFrom(sendTo);
-            const effectiveReplyTo = replyTo ?? inferredAsk?.message.id;
-            if (confirmSend && !(cwd && openProjectPaneIfMissing)) {
-              const confirmed = await ctx.ui.confirm(
-                "Send message",
-                `Send to "${targetDisplay}":\n\n${message}${attachmentText}`,
-              );
-              if (!confirmed) {
-                return {
-                  content: [{ type: "text", text: "Message cancelled by user" }],
-                  details: {},
-                };
-              }
-            }
-            const result = await connectedClient.send(sendTo, {
-              text: message,
-              attachments,
-              replyTo: effectiveReplyTo,
-              supersedes,
-              retryOf,
-            });
-            if (!result.delivered) {
-              const errorText = result.reason ?? "Session may not exist or has disconnected.";
-              return {
-                content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
-                details: deliveryDetails(result),
-              };
-            }
-            pi.appendEntry("intercom_sent", {
-              to: targetDisplay,
-              message: { text: message, attachments, replyTo: effectiveReplyTo, supersedes, retryOf },
-              messageId: result.id,
-              timestamp: Date.now(),
-            });
-            if (effectiveReplyTo) {
-              dismissIncomingAsk(effectiveReplyTo);
-            }
+          return deliverMessage(connectedClient, ctx, _signal, {
+            to, cwd, openProjectPaneIfMissing, focus, message, attachments, replyTo, supersedes, retryOf, noWake,
+          });
+        }
+
+        case "handover": {
+          if (!to && !cwd) {
             return {
-              content: [{
-                type: "text",
-                text: target.projectPane
-                  ? `Opened Herdr project pane ${target.projectPane.paneId} for ${target.projectPane.projectRoot} and sent message to ${targetDisplay}`
-                  : inferredAsk ? `Reply sent to ${targetDisplay} (inferred from pending ask)` : `Message sent to ${targetDisplay}`,
-              }],
-              details: {
-                ...deliveryDetails(result),
-                ...(effectiveReplyTo ? { replyTo: effectiveReplyTo } : {}),
-                ...(target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {}),
-              },
-            };
-          } catch (error) {
-            return {
-              content: [{ type: "text", text: `Failed to send: ${getErrorMessage(error)}` }],
+              content: [{ type: "text", text: "Missing 'to' or 'cwd' parameter" }],
               details: { error: true },
             };
           }
+          if (replyTo || supersedes || retryOf || attachments?.length) {
+            return {
+              content: [{ type: "text", text: "Handover always sends a new message; replyTo, supersedes, retryOf, and attachments are not supported." }],
+              details: { error: true },
+            };
+          }
+          let handoverText: string;
+          try {
+            handoverText = await buildHandoverText(connectedClient, ctx, { goal: message, crossMachine: Boolean(to?.includes("@")) }, _signal);
+          } catch (error) {
+            return {
+              content: [{ type: "text", text: `Handover failed: ${getErrorMessage(error)}` }],
+              details: { error: true },
+            };
+          }
+          return deliverMessage(connectedClient, ctx, _signal, { to, cwd, openProjectPaneIfMissing, focus, message: handoverText, handover: true });
         }
 
         case "ask": {
@@ -2605,13 +2905,19 @@ Usage:
             };
           }
 
+          if (to?.includes("@")) {
+            return {
+              content: [{ type: "text", text: `Cross-machine ask is not supported. Use send to ${to}; the peer's answer arrives as a new message.` }],
+              details: { error: true },
+            };
+          }
+
           if (_signal?.aborted) {
             return {
               content: [{ type: "text", text: "Cancelled" }],
               details: { error: true },
             };
           }
-          let replyPromise: Promise<Message> | null = null;
           let deliveryState = "created";
           let questionId: string | null = null;
 
@@ -2626,14 +2932,7 @@ Usage:
             if (cwd) {
               target = await resolveCwdDeliveryTarget(connectedClient, { to, cwd, openProjectPaneIfMissing, focus, signal: _signal });
             } else {
-              const resolved = await resolveSessionTarget(connectedClient, to);
-              if (!resolved) {
-                return {
-                  content: [{ type: "text", text: `Session "${to}" is not currently connected. Blocking asks are not queued; use send for a non-blocking mailbox delivery or retry after the session reconnects.` }],
-                  details: { error: true },
-                };
-              }
-              target = { id: resolved, label: to };
+              target = { id: (await resolveSessionTarget(connectedClient, to!)) ?? to!, label: to! };
             }
             const sendTo = target.id;
             const targetDisplay = target.projectPane ? target.label : to ?? target.label;
@@ -2655,65 +2954,48 @@ Usage:
                 details: { error: true },
               };
             }
-            questionId = randomUUID();
-            replyPromise = waitForReply(sendTo, questionId, _signal, () => connectedClient.cancelAsk(questionId!), () => latestDeliveryState(questionId, deliveryState));
-            replyPromise.catch(() => undefined);
-            const sendResult = await connectedClient.send(sendTo, {
-              messageId: questionId,
-              text: message,
-              attachments,
-              replyTo,
-              expectsReply: true,
-              supersedes,
-              retryOf,
+            const sent = await askWithNamePrefixFallback(connectedClient, { rawTo: cwd ? "" : to!, firstTarget: sendTo, display: targetDisplay }, { text: message, attachments, replyTo, supersedes, retryOf }, {
+              signal: _signal,
+              onAttempt: (askId) => { questionId = askId; },
+              deliveryState: () => latestDeliveryState(questionId, deliveryState),
             });
+            const { result: sendResult, display: askTarget, resolution } = sent;
 
             deliveryState = sendResult.delivery;
             if (!sendResult.delivered) {
-              const errorText = sendResult.reason ?? "Session may not exist or has disconnected.";
-              rejectReplyWaiter(new Error(`Message to "${targetDisplay}" was not delivered: ${errorText}`));
-              if (replyPromise) {
-                try {
-                  await replyPromise;
-                } catch {
-                  // The waiter was already rejected above. Keep the delivery failure as the only error here.
-                }
-              }
+              const errorText = sent.noMatchText
+                ? `${sent.noMatchText} ${BLOCKING_ASK_GUIDANCE}`
+                : sendResult.code === "E_TARGET_DISCONNECTED"
+                  ? `Session "${askTarget}" is not currently connected. ${BLOCKING_ASK_GUIDANCE}`
+                  : `${undeliveredText(askTarget, sendResult)}${resolution}`;
               return {
-                content: [{ type: "text", text: `Message to "${targetDisplay}" was not delivered: ${errorText}` }],
+                content: [{ type: "text", text: errorText }],
                 details: { error: true, ...deliveryDetails(sendResult) },
               };
             }
             pi.appendEntry("intercom_sent", {
-              to: targetDisplay,
+              to: askTarget,
               message: { text: message, attachments, replyTo, supersedes, retryOf },
               messageId: sendResult.id,
               timestamp: Date.now(),
             });
-            const replyMessage = await replyPromise;
+            const replyMessage = await sent.reply;
             const replyText = replyMessage.content.text;
             const replyAttachments = replyMessage.content.attachments?.length
               ? formatAttachments(replyMessage.content.attachments)
               : "";
             pi.appendEntry("intercom_received", {
-              from: targetDisplay,
+              from: askTarget,
               message: { text: replyText, attachments: replyMessage.content.attachments },
               messageId: replyMessage.id,
               timestamp: replyMessage.timestamp,
             });
             return {
-              content: [{ type: "text", text: `**Reply from ${targetDisplay}:**\n${replyText}${replyAttachments}` }],
+              content: [{ type: "text", text: `**Reply from ${askTarget}${resolution}:**\n${replyText}${replyAttachments}` }],
               details: target.projectPane ? { openedProjectPane: true, paneId: target.projectPane.paneId, projectRoot: target.projectPane.projectRoot } : {},
             };
           } catch (error) {
             rejectReplyWaiter(toError(error));
-            if (replyPromise) {
-              try {
-                await replyPromise;
-              } catch {
-                // The waiter is cleanup-only on this path. The real failure is the one from the outer catch.
-              }
-            }
             return {
               content: [{ type: "text", text: `Failed: ${getErrorMessage(error)}` }],
               details: { error: true, ...(questionId ? { messageId: questionId, deliveryState: latestDeliveryState(questionId, deliveryState) } : {}) },
@@ -2743,13 +3025,13 @@ Usage:
               replyTo: target.message.id,
             });
             if (!result.delivered) {
-              const errorText = result.reason ?? "Session may not exist or has disconnected.";
-              if (result.reason === "Session not found") {
+              const closedAsk = isClosedAskReply(result);
+              if (closedAsk || result.reason === "Session not found") {
                 dismissIncomingAsk(target.message.id);
               }
               return {
-                content: [{ type: "text", text: `Reply to "${target.from.name || target.from.id}" was not delivered: ${errorText}` }],
-                details: deliveryDetails(result),
+                content: [{ type: "text", text: closedAsk ? closedAskText(target.from.name || target.from.id) : undeliveredText(target.from.name || target.from.id, result) }],
+                details: { ...deliveryDetails(result), ...(closedAsk ? { error: true } : {}) },
               };
             }
             dismissIncomingAsk(target.message.id);
@@ -2760,7 +3042,7 @@ Usage:
               timestamp: Date.now(),
             });
             return {
-              content: [{ type: "text", text: `Reply sent to ${target.from.name || target.from.id}` }],
+              content: [{ type: "text", text: result.delivery === "queued" ? queuedText(target.from.name || target.from.id, "reply") : `Reply sent to ${target.from.name || target.from.id}${result.demoted ? `. ${LATE_REPLY_NOTE}` : ""}` }],
               details: { ...deliveryDetails(result), replyTo: target.message.id },
             };
           } catch (error) {
@@ -2796,10 +3078,13 @@ Usage:
           try {
             const mySessionId = connectedClient.sessionId;
             const sessions = await connectedClient.listSessions();
+            const pool = getIntercomScopeId();
+            const mySession = sessions.find((session) => session.id === mySessionId);
+            const shortId = (mySessionId ?? "unknown").slice(0, 8);
             return {
               content: [{
                 type: "text",
-                text: `**Intercom Status:**\nConnected: Yes\nSession ID: ${mySessionId}\nActive sessions: ${sessions.length}`,
+                text: `**Intercom status:**\nConnected: Yes\nSession ID: ${mySessionId}\nSession name: ${mySession?.name ?? "(unnamed)"} (short id: ${shortId})${pool ? `\nPool: ${pool}` : ""}\nActive sessions: ${sessions.length}`,
               }],
               details: {},
             };
@@ -2818,10 +3103,12 @@ Usage:
           };
       }
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       const action = typeof args.action === "string" ? args.action : "inferred";
       const target = typeof args.to === "string" && args.to.trim() ? args.to.trim() : undefined;
-      const messagePreview = previewText(args.message, 96);
+      const messageText = context.expanded && typeof args.message === "string"
+        ? args.message
+        : previewText(args.message, 96);
       const attachmentCount = Array.isArray(args.attachments) ? args.attachments.length : 0;
       let text = theme.fg("toolTitle", theme.bold("intercom "));
       text += theme.fg(action === "ask" ? "warning" : action === "reply" ? "success" : "accent", action);
@@ -2831,8 +3118,8 @@ Usage:
       if (attachmentCount > 0) {
         text += " " + theme.fg("dim", `(${attachmentCount} attachment${attachmentCount === 1 ? "" : "s"})`);
       }
-      if (messagePreview) {
-        text += "\n  " + theme.fg("dim", messagePreview);
+      if (messageText) {
+        text += "\n  " + theme.fg("dim", messageText);
       }
       return new Text(text, 0, 0);
     },
@@ -2902,7 +3189,7 @@ Usage:
     if (opensAliasInput) {
       if (!liveContext.hasUI) {
         const currentAlias = pi.getSessionName()?.trim();
-        notifyAliasCommand(
+        notifyCommand(
           liveContext,
           alias ? "The alias menu requires an interactive UI; use /alias <name>." : currentAlias ? `Session alias: ${currentAlias}` : "No session alias set. Use /alias <name>.",
           alias ? "warning" : "info",
@@ -2919,13 +3206,13 @@ Usage:
           currentAlias ? `Current alias: ${currentAlias}` : "Enter an alias",
         );
       } catch (error) {
-        notifyAliasCommand(liveContext, `Unable to set session alias: ${getErrorMessage(error)}`, "error", commandGeneration);
+        notifyCommand(liveContext, `Unable to set session alias: ${getErrorMessage(error)}`, "error", commandGeneration);
         return;
       }
       if (entered === undefined) return;
       alias = entered.trim();
       if (!alias) {
-        notifyAliasCommand(liveContext, "Session alias cannot be empty.", "warning", commandGeneration);
+        notifyCommand(liveContext, "Session alias cannot be empty.", "warning", commandGeneration);
         return;
       }
     }
@@ -2934,7 +3221,7 @@ Usage:
     try {
       pi.setSessionName(alias);
     } catch (error) {
-      notifyAliasCommand(liveContext, `Unable to set session alias: ${getErrorMessage(error)}`, "error", commandGeneration);
+      notifyCommand(liveContext, `Unable to set session alias: ${getErrorMessage(error)}`, "error", commandGeneration);
       return;
     }
 
@@ -2942,7 +3229,176 @@ Usage:
     // an ExtensionAPI event. Push the new identity directly so broker peers
     // see the alias without waiting for the idle name poll.
     syncPresenceIdentity(liveContext.sessionManager.getSessionId());
-    notifyAliasCommand(liveContext, `Session alias set: ${alias}`, "info", commandGeneration);
+    notifyCommand(liveContext, `Session alias set: ${alias}`, "info", commandGeneration);
+  }
+
+  async function runIntercomPoolCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const commandGeneration = runtimeGeneration;
+    const liveContext = getLiveContext(ctx, commandGeneration);
+    if (!liveContext) return;
+    const requested = args.trim();
+    if (!requested) {
+      notifyCommand(liveContext, `Intercom pool: ${getIntercomScopeId() ?? "default"}`, "info", commandGeneration);
+      return;
+    }
+    const nextPool = requested === "default" ? undefined : requested;
+    // A connect already in flight registered with the old pool; let it settle first.
+    await reconnectPromise?.catch(() => undefined);
+    if (!getLiveContext(liveContext, commandGeneration)) return;
+    if (nextPool === getIntercomScopeId()) {
+      notifyCommand(liveContext, `Already in intercom pool: ${requested}`, "info", commandGeneration);
+      return;
+    }
+    if (replyWaiter) {
+      // The reply is routed inside the current pool and would be lost after the switch.
+      notifyCommand(liveContext, `Cannot switch intercom pool while waiting for a reply from "${replyWaiter.from}". Wait for the reply or cancel the ask first.`, "warning", commandGeneration);
+      return;
+    }
+
+    setIntercomScopeId(nextPool);
+    const previousClient = client;
+    client = null;
+    clearReconnectTimer();
+    markLocalExtensionsDisconnected();
+    await previousClient?.disconnect().catch(() => undefined);
+    if (!getLiveContext(liveContext, commandGeneration)) return;
+    try {
+      await ensureConnected("background");
+    } catch (error) {
+      if (getLiveContext(liveContext, commandGeneration)) {
+        // A tool connect that started during the switch may own this failed attempt, and it does not retry.
+        scheduleReconnect();
+      }
+      notifyCommand(liveContext, `Switched to intercom pool ${requested}, but intercom is unavailable: ${getErrorMessage(error)}. Retrying in the background.`, "warning", commandGeneration);
+      return;
+    }
+    notifyCommand(liveContext, `Joined intercom pool: ${requested}`, "info", commandGeneration);
+  }
+
+  async function runHandoverCommand(args: string, ctx: ExtensionContext): Promise<void> {
+    const commandGeneration = runtimeGeneration;
+    const liveContext = getLiveContext(ctx, commandGeneration);
+    if (!liveContext) return;
+    if (!liveContext.hasUI || (liveContext as ExtensionContext & { mode?: string }).mode !== "tui") {
+      notifyCommand(liveContext, "/handover requires the interactive terminal UI; use the intercom tool's handover action instead.", "error", commandGeneration);
+      return;
+    }
+    const input = args.trim();
+    if (!input) {
+      await openHandoverPicker(liveContext, commandGeneration);
+      return;
+    }
+    const target = input.split(/\s+/, 1)[0]!;
+    const goal = input.slice(target.length).trim() || undefined;
+    const isPath = /^(\/|\.\.?\/|~(\/|$))/.test(target);
+    const request = isPath ? { cwd: expandHomePath(target), openProjectPaneIfMissing: true } : { to: target };
+    await performHandover(liveContext, commandGeneration, request, { goal, crossMachine: !isPath && target.includes("@") });
+  }
+
+  async function openHandoverPicker(ctx: ExtensionContext, generation: number, preselectSessionId?: string): Promise<void> {
+    let pickerClient: IntercomClient;
+    try {
+      pickerClient = await ensureConnected("tool");
+    } catch (error) {
+      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", generation);
+      return;
+    }
+    if (!getLiveContext(ctx, generation)) return;
+    syncPresenceIdentity(ctx.sessionManager.getSessionId());
+
+    let sessions: SessionInfo[];
+    try {
+      sessions = await pickerClient.listSessions();
+    } catch (error) {
+      notifyIfLive(ctx, `Failed to list sessions: ${getErrorMessage(error)}`, "error", generation);
+      return;
+    }
+    const currentSession = sessions.find((session) => session.id === pickerClient.sessionId);
+    if (!currentSession) {
+      notifyIfLive(ctx, "Current session is missing from intercom session list", "error", generation);
+      return;
+    }
+    if (!getLiveContext(ctx, generation)) return;
+
+    const discoveryDeps = { run: runCommand, herdrBin: process.env.HERDR_BIN_PATH ?? "herdr" };
+    const lister: RemoteSessionLister = {
+      listMachines: () => listSavedMachines(discoveryDeps),
+      listAgents: (machine) => listMachineAgents(machine, discoveryDeps),
+    };
+    const picked = await ctx.ui.custom<HandoverPickerResult | undefined>(
+      (tui, theme, keybindings, done) => new HandoverPicker(tui, theme, keybindings, { currentSession, sessions, lister, preselectSessionId }, done),
+      { overlay: true, overlayOptions: { width: 88 } },
+    ).catch(() => undefined);
+    if (!picked || !getLiveContext(ctx, generation)) return;
+
+    const { target, goal } = picked;
+    if (target.kind === "local") {
+      await performHandover(ctx, generation, { to: target.session.id }, { goal, crossMachine: false });
+      return;
+    }
+    if (target.kind === "remote") {
+      await performHandover(ctx, generation, { to: target.target }, { goal, crossMachine: true });
+      return;
+    }
+    const path = (await ctx.ui.input("Project path for the new session", "~/dev/project"))?.trim();
+    if (!getLiveContext(ctx, generation)) return;
+    if (!path) {
+      notifyIfLive(ctx, "Handover cancelled", "info", generation);
+      return;
+    }
+    await performHandover(ctx, generation, { cwd: expandHomePath(path), openProjectPaneIfMissing: true }, { goal, crossMachine: false });
+  }
+
+  async function performHandover(
+    ctx: ExtensionContext,
+    generation: number,
+    request: Pick<DeliveryRequest, "to" | "cwd" | "openProjectPaneIfMissing">,
+    options: { goal?: string; crossMachine: boolean },
+  ): Promise<void> {
+    let handoverClient: IntercomClient;
+    try {
+      handoverClient = await ensureConnected("tool");
+    } catch (error) {
+      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", generation);
+      return;
+    }
+    if (!getLiveContext(ctx, generation)) return;
+
+    const generated = await ctx.ui.custom<{ text: string } | { error: string } | null>((tui, theme, _keybindings, done) => {
+      const loader = new BorderedLoader(tui, theme, "Generating handover...");
+      loader.onAbort = () => done(null);
+      buildHandoverText(handoverClient, ctx, options, loader.signal).then(
+        (text) => done({ text }),
+        (error) => done(loader.signal.aborted ? null : { error: getErrorMessage(error) }),
+      );
+      return loader;
+    });
+    if (!getLiveContext(ctx, generation)) return;
+    if (!generated) {
+      notifyIfLive(ctx, "Handover cancelled", "info", generation);
+      return;
+    }
+    if ("error" in generated) {
+      notifyIfLive(ctx, `Handover failed: ${generated.error}`, "error", generation);
+      return;
+    }
+
+    const edited = await ctx.ui.editor("Edit handover", generated.text);
+    if (!getLiveContext(ctx, generation)) return;
+    if (edited === undefined || !edited.trim()) {
+      notifyIfLive(ctx, "Handover cancelled", "info", generation);
+      return;
+    }
+
+    try {
+      handoverClient = await ensureConnected("tool");
+    } catch (error) {
+      notifyIfLive(ctx, `Intercom unavailable: ${getErrorMessage(error)}`, "error", generation);
+      return;
+    }
+    const result = await deliverMessage(handoverClient, ctx, undefined, { ...request, message: edited, handover: true });
+    const failed = result.details.error === true || result.details.delivered === false;
+    notifyIfLive(ctx, failed ? firstTextContent(result) : `Handover: ${firstTextContent(result)}`, failed ? "error" : "info", generation);
   }
 
   async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
@@ -2981,12 +3437,17 @@ Usage:
       return;
     }
 
-    const selectedSession = await ctx.ui.custom<SessionInfo | undefined>(
-      (_tui, theme, keybindings, done) => new SessionListOverlay(theme, keybindings, currentSession, sessions, done),
+    const selection = await ctx.ui.custom<SessionListSelection | undefined>(
+      (_tui, theme, keybindings, done) => new SessionListOverlay(theme, keybindings, currentSession, sessions, done, getIntercomScopeId()),
       { overlay: true, overlayOptions: { width: 88 } }
     ).catch(() => undefined);
 
-    if (!selectedSession || !getLiveContext(ctx, overlayGeneration)) return;
+    if (!selection || !getLiveContext(ctx, overlayGeneration)) return;
+    if (selection.action === "handover") {
+      await openHandoverPicker(ctx, overlayGeneration, selection.session.id);
+      return;
+    }
+    const selectedSession = selection.session;
 
     try {
       overlayClient = await ensureConnected("overlay");
@@ -3010,7 +3471,7 @@ Usage:
         messageId: result.messageId,
         timestamp: Date.now(),
       });
-      notifyIfLive(ctx, `Message sent to ${targetLabel}`, "info", overlayGeneration);
+      notifyIfLive(ctx, result.queued ? queuedText(targetLabel) : `Message sent to ${targetLabel}`, "info", overlayGeneration);
     }
   }
 
@@ -3024,9 +3485,19 @@ Usage:
     handler: async (_args, ctx) => insertIntercomId(ctx),
   });
 
+  pi.registerCommand("intercom-pool", {
+    description: "Show or switch this session's intercom pool (usage: /intercom-pool, /intercom-pool <name>, or /intercom-pool default)",
+    handler: async (args, ctx) => runIntercomPoolCommand(args, ctx),
+  });
+
   pi.registerCommand("alias", {
     description: "Set the current session alias (usage: /alias <name> or /alias menu)",
     handler: async (args, ctx) => setIntercomAlias(args, ctx),
+  });
+
+  pi.registerCommand("handover", {
+    description: "Summarize this session and hand it over to another session (usage: /handover to pick a session, or /handover <target or project path> [next task])",
+    handler: async (args, ctx) => runHandoverCommand(args, ctx),
   });
 
   pi.registerShortcut("alt+m", {

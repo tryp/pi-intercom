@@ -4,6 +4,108 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+### Added
+- Sending to `name@machine` no longer requires Herdr. pi-intercom connects to the machine over SSH by that host name (including `~/.ssh/config` aliases), finds the session in that machine's intercom roster, and delivers the message there. This also reaches Pi sessions that run outside a Herdr pane on a machine saved in Herdr. The SSH connection must work without a password or host-key prompt. Thanks to [@mblarsen](https://github.com/mblarsen) for issue #194.
+- Extension channels have `unregister()`. A session can leave a namespace it registered, which frees one of its 32 extension slots and, if it owned the namespace, hands ownership to the next owner-eligible member. Thanks to [@wayne930242](https://github.com/wayne930242) for #184.
+- A sender can mark a message as information only. With `noWake: true` on `send` (or `pi-intercom send --no-wake`), an idle session gets the message without starting a new turn and reads it the next time it runs, so a "no reply needed" update no longer costs the receiver a full model request. Asks and replies always wake the receiver. Thanks to [@erikdarlingdata](https://github.com/erikdarlingdata) for issue #195.
+
+### Changed
+- The bundled `pi-intercom` skill is a quarter of its old size and no longer says intercom is same-machine only, which made agents refuse to message sessions on other machines. It now covers sending and handing over to `name@machine`, asking a waiting subagent a follow-up question inside your reply, and steering a subagent after a progress update.
+- Intercom errors now say what to do next: a failed `reply` points to `pending` or `send`, an `ask` to another machine says to use `send`, an `ask` to a subagent that is waiting on you says to answer it with `reply`, and a message to a directory with no session asks the agent to open a new Pi pane only when the user wants one.
+- The README now explains the ask timeouts: the Pi tool waits 10 minutes and the CLI 120 seconds by default, and the broker reads its own `PI_INTERCOM_ASK_TIMEOUT_MS` when it starts, which limits how long a reply is accepted. Thanks to [@mimadiule](https://github.com/mimadiule) for issue #189.
+- The README now documents the mailbox for disconnected sessions: who gets queued mail, when it expires, and what a broker restart loses. Thanks to [@mimadiule](https://github.com/mimadiule) for issue #188.
+
+### Fixed
+- A cross-machine send no longer crashes Pi when SSH or the remote relay closes its input before the message has finished writing. Failed commands retain their diagnostics, and incomplete writes cannot report success. Thanks to [@Oscar-Williams](https://github.com/Oscar-Williams) for #185.
+- After a reboot, the broker could refuse to start for hours when its old pid file pointed at a process the system had since given to another user. It now treats that pid as stale. Thanks to [@mimadiule](https://github.com/mimadiule) for issue #186.
+- After a reboot, the broker could also refuse to start when its old pid file pointed at an unrelated program of the same user, and intercom stayed down until the file was deleted by hand. The broker now counts the recorded process as a running broker only if it also answers on the broker's socket or pipe; a running broker is still never replaced. Thanks to [@wayne930242](https://github.com/wayne930242) for #198.
+- A reply sent after its ask had timed out, been cancelled, or already been answered was rejected and its content lost. It now reaches the asker as an ordinary message marked as a late reply. If the asker has disconnected or the broker has restarted, the reply fails and the tool tells the agent to use `send` instead. Thanks to [@mimadiule](https://github.com/mimadiule) for issue #187.
+
+## [0.18.1] - 2026-10-22
+
+### Changed
+- On Pi 1.2.0 or newer, a message that wakes an idle session no longer adds an extra "New intercom message above." line to the transcript. Older Pi versions still show that line, because they need it so other extensions can add to the prompt. Thanks to [@odfalik](https://github.com/odfalik) for #182.
+
+## [0.18.0] - 2026-10-20
+
+### Highlights
+- In fullscreen mode, click a message to expand or collapse just that one.
+- Sending to a session that isn't connected now says the message is waiting for it, instead of `Message sent`.
+- Queued messages are no longer lost a few seconds after the last session closes.
+- A shortened or slightly wrong session name now reaches the right session, or tells you which name you probably meant.
+- `handover` works when your selected model is a virtual model, such as a router.
+
+### Added
+- In fullscreen mode, clicking an intercom message expands or collapses just that message. Ctrl+O still expands or collapses all of them at once. Thanks to [@summer-tt](https://github.com/summer-tt) for #178.
+
+### Fixed
+- `handover` failed with `Virtual model … must be routed before streaming` when the selected model was a Pi virtual model, such as a router. It now works with virtual models. Thanks to [@colinperel](https://github.com/colinperel) for #176 and #177.
+- A `send`, `reply`, or progress update to a disconnected session said `Message sent`, even though the message was only waiting in the broker's mailbox for that session to come back. The result now says the session is not connected and the message is waiting until it reconnects. A message that arrived after its session was replaced or shut down used to vanish without a trace; the sender now gets an `expired` receipt for it. Thanks to [@Jaggerxtrm](https://github.com/Jaggerxtrm) for #172.
+- A slightly wrong session name failed with `Session not found`, which reads as if the session had died. This happened most often with Herdr subagent names like `subagent-chat-…` that were cut short. A name that isn't an exact match now goes to the one connected session whose name starts with it, and the result says which session that was. A message to the exact name of an offline session still waits in that session's mailbox and never goes to a different session. If several names match, the error lists them; if none do, it suggests the closest name and points to `intercom list`. `status` now shows the session's own name. Thanks to [@cabi](https://github.com/cabi) for #174 and #175.
+- Messages queued for a disconnected session were lost about 5 seconds after the last connected session closed, because the broker shut down when idle and its mailbox lives in memory. The broker now stays running while it holds queued messages, and shuts down once they have been delivered or have expired (after 24 hours). Thanks to [@odfalik](https://github.com/odfalik) for raising this in #173.
+
+## [0.17.1] - 2026-10-14
+
+### Highlights
+- Extension state now saves on Windows. Before, every save failed quietly.
+- A plain `reply` answers the ask you are working on, not an older message that came in without starting a turn.
+- One stuck session can no longer make the broker's memory grow without limit.
+
+### Fixed
+- On Windows, extension state was never saved. Every save failed with `Failed to persist extension state`, because Windows won't flush a file that was opened read-only. The broker now opens the file for writing first. If a save still fails, the message now includes the underlying error. Thanks to [@coylemichael](https://github.com/coylemichael) for issue #166.
+- A plain `intercom({ action: "reply" })` could answer the wrong session. A message that didn't start a turn stayed queued. That covers every message under `inboundTrigger: "never"` and non-replies under `"replies"`. The next turn then replied to that message's sender instead of the ask the turn was about, and the asker waited until its ask timed out. A plain reply now answers the one ask that arrived since the last turn. If several asks arrived at once, it asks you to name the session with `to`. Thanks to [@peterdsharpe](https://github.com/peterdsharpe) for issue #167.
+- The broker kept every message for a session that had stopped reading from its connection, so one stuck session could grow the broker's memory without limit. One report reached 6 GB over a month. The broker now drops a connection once more than 8 MB is waiting for it, and later messages for that session wait in its mailbox, as with any other disconnect. Waiting messages also no longer use far more memory than their size. A session that reconnects to a large backlog still gets all of it. Thanks to [@luwanglin](https://github.com/luwanglin) for issue #168.
+
+## [0.17.0] - 2026-10-10
+
+### Highlights
+- Move a running session into its own intercom pool with `/intercom-pool <name>`, so it only talks to sessions in that pool.
+- A send now reports success only after the other session confirms it got the message. Messages to a session that crashed are no longer reported as delivered.
+- Sessions that crash or stop responding drop off the session list on their own, and messages to them wait until they reconnect.
+- After the broker goes away, sessions keep trying to reconnect until it comes back, instead of staying offline.
+- If you use a shared `stableId` in `config.json`, switch to a separate `PI_INTERCOM_STABLE_ID` per session, then close all Pi sessions once after upgrading.
+
+### Added
+- `/intercom-pool <name>` moves a running session into a separate intercom pool, so it only talks to sessions in that pool. `/intercom-pool default` moves it back. The current pool shows in `status` and in the `/intercom` overlay. Thanks to [@Pl8tinium](https://github.com/Pl8tinium) for issue #156.
+
+### Fixed
+- If a background reconnect to the broker failed, pi-intercom never tried again. The session stayed offline until you next used the `intercom` tool or overlay. It now keeps retrying, waiting 1s, 2s, 5s, 10s, and then 30s between tries, until the broker is reachable (#159).
+- A send could report `socket_delivered` for a message the other session never got, because that session's process had died while its connection still looked open. The broker now waits up to 5 seconds for the receiving Pi session to confirm the message. Without that confirmation, the send reports an unconfirmed outcome you can retry, and an `ask` to an unresponsive session fails right away instead of waiting for the ask timeout. If the session was only slow, its later reply still arrives as an ordinary message. A send that reaches a session while it reloads can also report unconfirmed. The CLI and other non-Pi clients work as before. Thanks to [@catlain](https://github.com/catlain) for issue #157.
+- Two running Pi sessions with the same intercom session ID no longer take the ID from each other every second, with messages going to whichever one registered last. The first running session keeps the ID. The second gets `E_SESSION_HELD`, stops reconnecting, and shows which process and directory hold the ID; `/reload` tries again. If the session holding an ID has exited, a new session can take it right away. **Behavior change:** a machine-wide `stableId` in `config.json` now lets only one session at a time use intercom, so set a separate `PI_INTERCOM_STABLE_ID` for each session instead. This takes effect once the broker restarts, so close all Pi sessions once after upgrading. Thanks to [@Ribelio](https://github.com/Ribelio) for #155.
+- A session whose process died without closing its connection stayed in the session list, and messages kept going to it. The broker now drops a session that has been silent for three heartbeat intervals (90 seconds by default). Messages to it wait and are delivered when it reconnects. Thanks to [@catlain](https://github.com/catlain) for issue #157.
+- When an intercom message and a subagent notice reached an idle session at the same time, both extensions tried to wake it, and the second wake failed with `Agent is already processing a prompt`. pi-intercom and pi-subagents now share one wake per session, so the second message is added to the turn the first one starts. This needs the matching pi-subagents release.
+
+## [0.16.1] - 2026-10-04
+
+### Highlights
+- An intercom message that wakes an idle session now starts a normal turn, with everything your other extensions add to the prompt. Providers such as pi-claude-bridge no longer fail on that turn or get stuck afterwards.
+- You can see when a message woke a session: the transcript shows a short "New intercom message above." line.
+- Press Ctrl+O to read the full text of messages you send, not just the first line or so.
+
+### Fixed
+- A message that arrived while a session was idle started a turn without other extensions' `before_agent_start` additions to the prompt. Providers that check the prompt, such as pi-claude-bridge, failed that turn, and the session could stay broken afterwards. The message is now added to the session first, and the session wakes through a normal prompt, so those additions are included. The transcript shows the wake as a short "New intercom message above." line. Sessions already broken by the old behavior need the manual fix described in issue #152. Thanks to [@BGamboa13](https://github.com/BGamboa13) for issue #152 and [@pmontiel-x](https://github.com/pmontiel-x) for the follow-up diagnosis.
+- Pressing Ctrl+O now shows the full message of an outgoing `intercom` or `contact_supervisor` call. Before, long messages stayed cut off at a short preview even when expanded. Thanks to [@summer-tt](https://github.com/summer-tt) for PR #153.
+
+## [0.16.0] - 2026-09-30
+
+### Highlights
+- Hand your work to another session with `/handover`. Pi writes up what this session learned, decided, and changed, and the other session picks up the next task without starting from scratch.
+- Hand over to Pi sessions on your other computers. The `/handover` picker lists sessions on this machine and, when you ask, on your saved Herdr machines.
+- Press `h` in the Alt+M session list to hand over to the highlighted session.
+- On Windows, the broker no longer starts through a VBScript file that security tools flagged, and opening a Herdr project pane now starts Pi.
+
+### Added
+- `/handover <target> [next task]` and the intercom tool's `handover` action hand your session's context to another session. Pi summarizes what the session learned, decided, and changed, and the receiving session starts on the next task. You can edit the summary before sending it. If you give a project path and no session is running there, a Herdr pane opens one. `name@machine` targets on saved Herdr machines work too.
+- `/handover` with no arguments opens a picker. Choose a session on this machine, start a new session in a project, or load Pi sessions from your other Herdr machines. In the Alt+M session list, press `h` to hand over to the highlighted session.
+
+### Changed
+- On Windows, the broker no longer starts through a `broker-launch.vbs` file, which endpoint security tools flagged as suspicious. It now runs as one hidden Node process, the same way as on other platforms, and a failed start shows the broker's error output. If you set a custom `brokerCommand` on Windows, it must point to an executable, not a `.cmd` shim. Thanks to [@jhonruda25](https://github.com/jhonruda25) for issue #142.
+
+### Fixed
+- You can now send to Pi sessions on another machine even if they were never renamed in Herdr. Address them as `full-session-uuid@machine`. Before, only renamed sessions could be found.
+- Opening a Herdr project pane now starts Pi on Windows. The command was sent in quotes, and PowerShell printed it as text instead of running it. Thanks to [@elliot-chung](https://github.com/elliot-chung) for #143.
+- When another machine can't be reached, the error now shows Herdr's reason instead of raw debug output. If that machine's Herdr server is too old to list sessions, the error says how to update it.
+
 ## [0.15.0] - 2026-09-27
 
 ### Highlights
