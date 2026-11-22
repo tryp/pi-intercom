@@ -141,7 +141,15 @@ export function isMessage(value: unknown): value is Message {
     return false;
   }
 
+  if (value.lateReplyTo !== undefined && typeof value.lateReplyTo !== "string") {
+    return false;
+  }
+
   if (value.expectsReply !== undefined && typeof value.expectsReply !== "boolean") {
+    return false;
+  }
+
+  if (value.noWake !== undefined && typeof value.noWake !== "boolean") {
     return false;
   }
 
@@ -168,6 +176,7 @@ export function messageDeliveryFingerprint(message: Message, targetId: string): 
     attachments: message.content.attachments,
     replyTo: message.replyTo,
     expectsReply: message.expectsReply,
+    noWake: message.noWake,
     supersedes: message.supersedes,
     retryOf: message.retryOf,
     provenance: message.provenance,
@@ -265,6 +274,12 @@ export function isSessionRegistration(value: unknown): value is SessionRegistrat
     return false;
   }
   if (value.herdrSessionPath !== undefined && typeof value.herdrSessionPath !== "string") {
+    return false;
+  }
+  if (value.acknowledgesReceipts !== undefined && typeof value.acknowledgesReceipts !== "boolean") {
+    return false;
+  }
+  if (value.livenessIntervalMs !== undefined && (typeof value.livenessIntervalMs !== "number" || !Number.isSafeInteger(value.livenessIntervalMs) || value.livenessIntervalMs <= 0)) {
     return false;
   }
 

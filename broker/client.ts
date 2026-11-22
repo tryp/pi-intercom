@@ -5,7 +5,7 @@ import { writeMessage, createMessageReader } from "./framing.ts";
 import { getBrokerConnectTarget, type BrokerConnectTarget } from "./paths.ts";
 import { isMessage, isMessageControl, isMessageReceipt, isSessionInfo } from "./protocol.ts";
 import { getIntercomScopeId } from "../config.ts";
-import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, type DeliveryDetails } from "../types.ts";
+import { EXACT_SEND_FEATURE, EXTENSION_BUS_FEATURE, SESSION_HELD_ERROR_CODE, type DeliveryDetails } from "../types.ts";
 import type {
   Attachment,
   BrokerMessage,
@@ -16,6 +16,7 @@ import type {
   MessageProvenance,
   MessageReceipt,
   SessionInfo,
+  SessionHolder,
   SessionRegistration,
 } from "../types.ts";
 
@@ -24,6 +25,7 @@ interface SendOptions {
   attachments?: Attachment[];
   replyTo?: string;
   expectsReply?: boolean;
+  noWake?: boolean;
   messageId?: string;
   supersedes?: string;
   retryOf?: string;
@@ -41,28 +43,35 @@ function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
 }
 
-/**
- * Liveness heartbeat interval. A half-open socket (peer killed with SIGKILL or
- * crashed without sending a FIN) stays "writable" indefinitely, so passive
- * close-event detection never fires and the client silently drops out of the
- * roster. The heartbeat actively round-trips a lightweight request and tears
- * down the socket if the broker does not respond within the timeout, letting
- * the existing onClose -> "disconnected" path drive reconnection.
- */
 function getLivenessIntervalMs(): number {
   const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_INTERVAL_MS ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : 30_000;
 }
 
 function getLivenessTimeoutMs(): number {
   const raw = Number.parseInt(process.env.PI_INTERCOM_LIVENESS_TIMEOUT_MS ?? "", 10);
-  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
+  return Number.isSafeInteger(raw) && raw > 0 ? Math.min(raw, getLivenessIntervalMs()) : 5_000;
 }
 
 function connectToBrokerTarget(target: BrokerConnectTarget): net.Socket {
   return typeof target === "string"
     ? net.connect(target)
     : net.connect({ host: target.host, port: target.port });
+}
+
+/** connect() rejected because another live process holds the requested session id. */
+export class IntercomSessionHeldError extends Error {
+  readonly code = SESSION_HELD_ERROR_CODE;
+  constructor(message: string, readonly holder: SessionHolder) {
+    super(message);
+    this.name = "IntercomSessionHeldError";
+  }
+}
+
+function parseSessionHolder(value: unknown): SessionHolder {
+  const { pid, cwd, name } = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  if (typeof pid !== "number" || typeof cwd !== "string") throw new Error("Invalid session holder");
+  return { pid, cwd, ...(typeof name === "string" ? { name } : {}) };
 }
 
 export class IntercomClient extends EventEmitter {
@@ -251,6 +260,10 @@ export class IntercomClient extends EventEmitter {
       };
 
       const onReaderError = (error: Error) => {
+        if (!connectionEstablished && error.cause instanceof IntercomSessionHeldError) {
+          onError(error.cause);
+          return;
+        }
         const protocolError = new Error(`Intercom protocol error: ${error.message}`, { cause: error });
         if (!connectionEstablished) {
           onError(protocolError);
@@ -288,7 +301,7 @@ export class IntercomClient extends EventEmitter {
         const scopeId = getIntercomScopeId();
         writeMessage(socket, {
           type: "register",
-          session,
+          session: { ...session, livenessIntervalMs: getLivenessIntervalMs() },
           ...(sessionId ? { sessionId } : {}),
           ...(scopeId ? { scopeId } : {}),
           ...(typeof target === "string" ? {} : { stateId: target.stateId }),
@@ -385,7 +398,7 @@ export class IntercomClient extends EventEmitter {
         }
 
         this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: true, delivery: delivery as "socket_delivered" | "queued" | undefined ?? "socket_delivered", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
+        pending.resolve({ id: messageId, delivered: true, delivery: delivery === "queued" ? "queued" : "socket_delivered", retryable: retryable === true, outcomeKnown: outcomeKnown !== false, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}), ...(brokerMessage.demoted === "late_reply" ? { demoted: "late_reply" as const } : {}) });
         break;
       }
 
@@ -402,7 +415,7 @@ export class IntercomClient extends EventEmitter {
         }
 
         this.pendingSends.delete(messageId);
-        pending.resolve({ id: messageId, delivered: false, reason, delivery: delivery as "failed" | "unknown" | undefined ?? "failed", retryable: retryable as boolean | undefined ?? false, outcomeKnown: outcomeKnown as boolean | undefined ?? true, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
+        pending.resolve({ id: messageId, delivered: false, reason, delivery: delivery === "unknown" ? "unknown" : "failed", retryable: retryable === true, outcomeKnown: outcomeKnown !== false, ...(typeof brokerMessage.code === "string" ? { code: brokerMessage.code } : {}) });
         break;
       }
 
@@ -463,6 +476,9 @@ export class IntercomClient extends EventEmitter {
         }
 
         if (this._sessionId === null) {
+          if (brokerMessage.code === SESSION_HELD_ERROR_CODE) {
+            throw new IntercomSessionHeldError(brokerMessage.error, parseSessionHolder(brokerMessage.holder));
+          }
           throw new Error(brokerMessage.error);
         }
         this.emit("error", new Error(brokerMessage.error));
@@ -637,6 +653,7 @@ export class IntercomClient extends EventEmitter {
       retryOf: options.retryOf,
       replyTo: options.replyTo,
       expectsReply: options.expectsReply,
+      noWake: options.noWake,
       provenance: options.provenance,
       crossMachine: options.crossMachine,
       content: {
